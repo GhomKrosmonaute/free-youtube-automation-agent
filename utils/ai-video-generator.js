@@ -54,6 +54,12 @@ class AIVideoGenerator {
     // Azure Speech configuration
     this.azureSpeechKey = resolvedCredentials.azure?.speechKey || process.env.AZURE_SPEECH_KEY;
     this.azureSpeechRegion = resolvedCredentials.azure?.speechRegion || process.env.AZURE_SPEECH_REGION;
+
+    // Local macOS narration (free, offline) via the built-in `say` command, converted with FFmpeg.
+    // Enabled with TTS_PROVIDER=macos_say; optional TTS_VOICE (e.g. "Thomas", "Eddy (Français (France))").
+    this.localTTSEnabled = process.platform === 'darwin' && String(process.env.TTS_PROVIDER || '').toLowerCase() === 'macos_say';
+    this.localTTSVoice = process.env.TTS_VOICE || 'Thomas';
+    this.localTTSRate = Number(process.env.TTS_RATE || 175);
     this.mediaGeneration = options.mediaGeneration || (this.db
       ? new MediaGenerationService(this.db, resolvedCredentials, { logger: this.logger })
       : null);
@@ -67,7 +73,11 @@ class AIVideoGenerator {
 
     try {
       let generatedPath;
-      if (this.elevenLabsApiKey && this.elevenLabsVoiceId) {
+      if (this.localTTSEnabled) {
+        provider = 'macos_say';
+        model = `say:${this.localTTSVoice}`;
+        generatedPath = await this.generateLocalMacTTS(text, outputPath);
+      } else if (this.elevenLabsApiKey && this.elevenLabsVoiceId) {
         provider = 'elevenlabs';
         model = this.elevenLabsModel;
         generatedPath = await this.generateElevenLabsTTS(text, outputPath);
@@ -142,6 +152,26 @@ class AIVideoGenerator {
       });
       writer.on('error', reject);
     });
+  }
+
+  async generateLocalMacTTS(text, outputPath) {
+    const { execFile } = require('child_process');
+    const { promisify } = require('util');
+    const execFileAsync = promisify(execFile);
+    const base = outputPath.replace(/\.[a-z0-9]+$/i, '');
+    const textPath = `${base}.say.txt`;
+    const aiffPath = `${base}.say.aiff`;
+    await fs.mkdir(path.dirname(outputPath), { recursive: true });
+    await fs.writeFile(textPath, text, 'utf8');
+    try {
+      await execFileAsync('say', ['-v', this.localTTSVoice, '-r', String(this.localTTSRate), '-f', textPath, '-o', aiffPath], { maxBuffer: 1024 * 1024 });
+      await runFFmpeg(['-y', '-i', aiffPath, '-ar', '44100', '-ac', '2', '-b:a', '160k', outputPath]);
+    } finally {
+      await fs.unlink(textPath).catch(() => {});
+      await fs.unlink(aiffPath).catch(() => {});
+    }
+    this.logger.info(`Local macOS TTS generation complete (voice: ${this.localTTSVoice})`);
+    return outputPath;
   }
 
   async generateOpenAITTS(text, outputPath) {

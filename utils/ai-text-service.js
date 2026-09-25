@@ -44,7 +44,19 @@ const PROVIDERS = {
     models: ['glm-5.3', 'glm-5.2', 'glm-5.1'],
     envKey: 'GLM_API_KEY',
   },
+  ollama: {
+    // Local, free, offline. Ollama exposes an OpenAI-compatible endpoint; any non-empty key works.
+    name: 'Ollama (local)',
+    baseURL: process.env.OLLAMA_BASE_URL || 'http://127.0.0.1:11434/v1',
+    defaultModel: process.env.OLLAMA_MODEL || 'qwen2.5:7b',
+    models: [...new Set([process.env.OLLAMA_MODEL || 'qwen2.5:7b', 'qwen2.5:7b', 'mistral-nemo', 'llama3.1:8b'])],
+    envKey: 'OLLAMA_API_KEY',
+  },
 };
+
+const CONTENT_LANGUAGE = process.env.CONTENT_LANGUAGE || 'en';
+const LANGUAGE_NAMES = { fr: 'French (français)', en: 'English', es: 'Spanish', de: 'German', it: 'Italian', pt: 'Portuguese' };
+const CONTENT_LANGUAGE_NAME = LANGUAGE_NAMES[CONTENT_LANGUAGE] || CONTENT_LANGUAGE;
 
 class AITextService {
   constructor(credentials = {}) {
@@ -128,7 +140,10 @@ class AITextService {
 
     const params = {
       model,
-      messages: [{ role: 'user', content: prompt }],
+      messages: [
+        { role: 'system', content: `You write for a YouTube channel whose language is ${CONTENT_LANGUAGE_NAME} (ISO "${CONTENT_LANGUAGE}"). Every natural-language value you produce (titles, topics, angles, scripts, descriptions, tags, keywords) must be written in ${CONTENT_LANGUAGE_NAME}. JSON keys stay exactly as requested, in English.` },
+        { role: 'user', content: prompt }
+      ],
       temperature,
     };
 

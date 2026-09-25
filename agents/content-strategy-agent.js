@@ -337,6 +337,7 @@ Turn the channel strategy and the supplied research signals into a focused conte
 Return only a valid JSON array with exactly ${targetCount} items using this shape:
 [{"topic":"specific video topic","pillar":"one exact content pillar from the supplied strategy","angle":"distinct audience-relevant angle","rationale":"why this advances the channel objective using the supplied evidence","format":"explainer|tutorial|list|review|story","length":"short|medium|long","sourceUrls":["exact URL from the supplied source catalog"]}]
 
+Language: write topic, angle and rationale in the language with ISO code "${process.env.CONTENT_LANGUAGE || 'en'}".
 Channel objective: ${channelStrategy.objective}
 Audience: ${channelStrategy.audience}
 Value proposition: ${channelStrategy.value_proposition || 'not specified'}
@@ -440,6 +441,7 @@ Return only valid JSON with this exact shape:
   "keywords": ["keyword"]
 }
 
+Language: write topic, angle, targetAudience and keywords in the language with ISO code "${process.env.CONTENT_LANGUAGE || 'en'}".
 Requested topic: ${requestedTopic || 'none'}
 Trending topics available: ${trendingTopics || 'Technology Trends'}
 Channel target audience: ${process.env.TARGET_AUDIENCE || 'General audience interested in educational content'}

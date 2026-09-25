@@ -1,14 +1,54 @@
-# AgentTube - ECGHuNZSECqTXabaLjkVrTEnguiNZLkKF1qi8oBGpump
+# free-youtube-automation-agent
 
 **The open-source AI agent that runs a YouTube channel end to end.**
 
-Join our telegram community: https://t.co/L4SzbqosOM
 
 Research topics → write scripts → generate narration and visuals → assemble videos → optimize metadata → review → schedule → publish → learn from analytics and from what your audience says.
 
 [![CI](https://github.com/darkzOGx/youtube-automation-agent/actions/workflows/ci.yml/badge.svg)](https://github.com/darkzOGx/youtube-automation-agent/actions/workflows/ci.yml)
 [![MIT License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Node.js 18+](https://img.shields.io/badge/node-18%2B-43853d.svg)](package.json)
+
+
+## This fork: private, safe, and 100% free
+
+[free-youtube-automation-agent](https://github.com/GhomKrosmonaute/free-youtube-automation-agent) is a fork of
+[darkzOGx/youtube-automation-agent](https://github.com/darkzOGx/youtube-automation-agent) that removes every paid
+dependency and hardens the defaults. Everything upstream still works; these are additions.
+
+**Free and local**
+- **Ollama text provider** (`OLLAMA_API_KEY`, `OLLAMA_BASE_URL`, `OLLAMA_MODEL`): scripts, strategy, SEO and
+  autonomous planning run on a local model. No account, no quota, works offline.
+- **macOS voice narration** (`TTS_PROVIDER=macos_say`, `TTS_VOICE`, `TTS_RATE`): narration through the built-in
+  `say` command, converted with FFmpeg. Passes the fail-closed narration checks.
+- Local FFmpeg slideshow visuals remain the default, so no image or video provider is ever billed.
+- `CONTENT_LANGUAGE` (ISO code) drives every prompt, the metadata language and the caption track, so non-English channels work out of the box.
+
+**Privacy**
+- Anonymous telemetry stays opt-in and off; nothing leaves the machine except the API calls you configure.
+- The dashboard binds to `127.0.0.1` unless `HOST` is set, so it is never exposed on your network by accident.
+
+**Safety**
+- `API_KEY` is documented as required; without it every mutating route was open to anything that could reach the port.
+- Dependencies updated (`sqlite3` 6, `sharp` 0.35) to clear the critical and high `npm audit` findings; install scripts are pinned through `allowScripts`.
+- Human approval before scheduling and private uploads are the recommended defaults for any new channel.
+
+### Free quickstart (macOS)
+
+```bash
+brew install ollama ffmpeg
+ollama serve &
+ollama pull qwen2.5:7b
+git clone https://github.com/GhomKrosmonaute/free-youtube-automation-agent
+cd free-youtube-automation-agent
+npm install
+cp .env.example .env
+# in .env: set OLLAMA_API_KEY=ollama, TTS_PROVIDER=macos_say, API_KEY=$(openssl rand -hex 24)
+npm run credentials:setup   # YouTube OAuth (free Google Cloud project, Desktop app client)
+npm start                   # http://localhost:3456
+```
+
+On Linux or Windows, keep Ollama for text and add a free Gemini key for narration (`GEMINI_API_KEY`).
 
 ## What's new on master
 

@@ -183,7 +183,8 @@ class YouTubeAutomationAgent {
       creds.openai?.apiKey || process.env.OPENAI_API_KEY ||
       creds.elevenLabs?.apiKey || process.env.ELEVENLABS_API_KEY ||
       creds.azureSpeech?.subscriptionKey || process.env.AZURE_SPEECH_KEY ||
-      hasGemini
+      hasGemini ||
+      (process.platform === 'darwin' && String(process.env.TTS_PROVIDER || '').toLowerCase() === 'macos_say')
     );
     const hasFFmpeg = await checkFFmpeg();
     const hasUpload = Boolean(creds.youtube && this.credentials.tokens?.youtube);
@@ -1832,7 +1833,9 @@ class YouTubeAutomationAgent {
     }
     
     const PORT = process.env.PORT || 3456;
-    this.app.listen(PORT, () => {
+    // Bind to loopback unless HOST is set explicitly, so the dashboard is never exposed on the LAN by accident.
+    const HOST = process.env.HOST || '127.0.0.1';
+    this.app.listen(PORT, HOST, () => {
       console.log(chalk.green(`\n✅ YouTube Automation Agent running on port ${PORT}`));
       console.log(chalk.gray('─'.repeat(50)));
       console.log(chalk.white('📊 Dashboard: ') + chalk.cyan(`http://localhost:${PORT}`));

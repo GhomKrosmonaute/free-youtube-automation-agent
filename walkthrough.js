@@ -106,6 +106,23 @@ const AI_PROVIDER_GUIDE = {
       credentials.aiProvider = { provider: 'glm', apiKey, model };
     },
     validationCreds: (apiKey, model) => ({ aiProvider: { provider: 'glm', apiKey, model } })
+  },
+  ollama: {
+    label: 'Ollama — local models, free and offline (no API key)',
+    keyUrl: 'https://ollama.com/download',
+    keyHint: 'any placeholder such as "ollama" (Ollama ignores it)',
+    instructions: [
+      'Install Ollama and keep it running (ollama serve)',
+      'Pull a model: ollama pull qwen2.5:7b',
+      'Type any placeholder as the key, e.g. "ollama"'
+    ],
+    models: [...PROVIDERS.ollama.models],
+    defaultModel: PROVIDERS.ollama.defaultModel,
+    covers: 'scripts only, fully local (use TTS_PROVIDER=macos_say on macOS or a Gemini key for voice)',
+    save(credentials, apiKey, model) {
+      credentials.aiProvider = { provider: 'ollama', apiKey: apiKey || 'ollama', model };
+    },
+    validationCreds: (apiKey, model) => ({ aiProvider: { provider: 'ollama', apiKey: apiKey || 'ollama', model } })
   }
 };
 

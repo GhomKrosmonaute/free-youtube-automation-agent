@@ -530,7 +530,7 @@ class CredentialManager {
     }
 
     if (!this.hasAITextProvider()) {
-      missing.push('an AI provider (OpenAI, Gemini, OpenRouter, Kimi, MiMo, or GLM)');
+      missing.push('an AI provider (OpenAI, Gemini, OpenRouter, Kimi, MiMo, GLM, or local Ollama)');
     }
 
     return missing;

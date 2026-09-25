@@ -120,6 +120,7 @@ Return only valid JSON with this exact shape:
   ]
 }
 
+Language: write the title, hook, every spoken line, and the CTA in the language with ISO code "${process.env.CONTENT_LANGUAGE || 'en'}" (JSON keys stay in English).
 Topic: ${strategy.topic}
 Style/content type: ${strategy.contentType}
 Angle: ${strategy.angle}

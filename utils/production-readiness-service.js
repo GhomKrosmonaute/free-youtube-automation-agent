@@ -281,7 +281,7 @@ class ProductionReadinessService {
       text_provider: 'Run npm run walkthrough, verify the selected model, and confirm provider credits or quota.',
       image_provider: 'Verify paid image access or rely on the built-in gradient visual fallback.',
       video_provider: 'Configure the selected provider credentials, choose local slideshow, or rerun with the paid video probe enabled.',
-      voice_narration: 'Configure OpenAI, Gemini TTS, ElevenLabs with a voice ID, or Azure Speech, then rerun.',
+      voice_narration: 'Configure OpenAI, Gemini TTS, ElevenLabs with a voice ID, Azure Speech, or TTS_PROVIDER=macos_say on macOS, then rerun.',
       video_assembly: 'Run npm install to restore ffmpeg-static, or configure FFMPEG_PATH to a working binary.',
       youtube_access: 'Reconnect YouTube in npm run walkthrough and ensure the Google account owns a channel.',
       upload_metadata: 'Edit the queued title, description, category, language, and tags before publishing.'
