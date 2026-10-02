@@ -1,10 +1,58 @@
 const crypto = require('crypto');
 const { Logger } = require('./logger');
+const jevClient = require('./jev');
+const { isReactMode } = require('./content-mode');
+const { reactProfile } = require('./react-profile');
 
 const FORCE_SSL_SCOPE = 'https://www.googleapis.com/auth/youtube.force-ssl';
 const COMMENT_FLAGS = ['question', 'request', 'praise', 'correction', 'spam', 'scam', 'toxic'];
 const QUARANTINE_FLAGS = ['spam', 'scam', 'toxic'];
 const THEME_KINDS = ['question', 'request', 'feedback', 'correction', 'praise'];
+// React mode: the stance a comment takes on what the video examines, from the react profile's `audience`: { stances:
+// { id: description }, goal: the stance the channel wants to see, engaged: the stances that engage with the subject,
+// reach: the stances of the audience the channel wants to reach, labels: { id: short label } }. No stances, no
+// measure.
+function audienceRules() {
+  const audience = reactProfile().audience || {};
+  const stances = audience.stances && typeof audience.stances === 'object' ? audience.stances : {};
+  const ids = Object.keys(stances);
+  const known = list => (Array.isArray(list) ? list : []).filter(id => stances[id]);
+  return {
+    stances,
+    goal: stances[audience.goal] ? audience.goal : null,
+    engaged: known(audience.engaged).length ? known(audience.engaged) : ids,
+    reach: known(audience.reach),
+    labels: Object.fromEntries(ids.map(id => [id, audience.labels?.[id] || id])),
+    goalLabel: audience.goalLabel || audience.labels?.[audience.goal] || audience.goal || ''
+  };
+}
+
+// Per video: how many comments of each stance; goalRate = the goal stance among the comments engaging with the subject,
+// reachRate = the stances of the audience to reach among all comments, in percent; examples: the most liked comments
+// in the goal stance.
+function persuasionOf(comments, videoId, rules = audienceRules()) {
+  const counts = Object.fromEntries(Object.keys(rules.stances).map(stance => [stance, 0]));
+  for (const comment of comments) if (counts[comment.stance] !== undefined) counts[comment.stance] += 1;
+  const sum = ids => ids.reduce((total, id) => total + (counts[id] || 0), 0);
+  const percent = (part, whole) => (whole ? Math.round((part / whole) * 1000) / 10 : null);
+  return {
+    classified: comments.length,
+    counts,
+    labels: rules.labels,
+    goal: rules.goal,
+    goalLabel: rules.goalLabel,
+    goalRate: rules.goal ? percent(counts[rules.goal], sum(rules.engaged)) : null,
+    reachRate: rules.reach.length ? percent(sum(rules.reach), comments.length) : null,
+    examples: rules.goal ? comments.filter(comment => comment.stance === rules.goal)
+      .sort((a, b) => b.likeCount - a.likeCount).slice(0, 5)
+      .map(comment => ({
+        commentId: comment.commentId,
+        excerpt: String(comment.text || '').replace(/\s+/g, ' ').slice(0, 200),
+        permalink: `https://www.youtube.com/watch?v=${encodeURIComponent(videoId)}&lc=${encodeURIComponent(comment.commentId)}`
+      })) : [],
+    measuredAt: new Date().toISOString()
+  };
+}
 
 class AudienceEngagementService {
   constructor(db, credentials, aiTextService, options = {}) {
@@ -20,7 +68,45 @@ class AudienceEngagementService {
     this.listCommentThreads = options.listCommentThreads || (params => this.defaultListCommentThreads(params));
     this.insertComment = options.insertComment || (params => this.defaultInsertComment(params));
     this.getChannelId = options.getChannelId || (() => this.defaultGetChannelId());
+    this.jev = options.jev || jevClient;
     this.channelId = null;
+  }
+
+  // Jev gives every new comment its stance on what the video examines, then the video's persuasion summary is recorded.
+  // Incremental: a comment is classified once. Without Jev or stances in the react profile, nothing is measured.
+  async classifyStances(videoId, title = '') {
+    const rules = audienceRules();
+    if (!this.jev?.enabled?.() || !Object.keys(rules.stances).length) return null;
+    const comments = await this.db.listCommentsWithoutStance(videoId, 300);
+    const insight = await this.db.getEngagementInsight(videoId);
+    const bundle = insight?.productionId ? await this.db.getProductionBundle?.(insight.productionId).catch(() => null) : null;
+    const claim = bundle?.script?.examinedClaim?.statement || bundle?.strategy?.topic || title;
+    let next = 0;
+    await Promise.all(Array.from({ length: Math.min(6, comments.length) }, async () => {
+      while (next < comments.length) {
+        const comment = comments[next++];
+        try {
+          const parent = comment.parentCommentId ? await this.db.getAudienceComment(comment.parentCommentId).catch(() => null) : null;
+          const answers = await this.jev.ask({
+            purpose: 'comment_stance',
+            state: {
+              video: title || insight?.title || '',
+              claimExamined: claim,
+              comment: String(comment.text || '').slice(0, 600),
+              ...(parent ? { replyingTo: String(parent.text || '').slice(0, 300) } : {})
+            },
+            questions: { stance: { type: 'choice', instructions: 'What does this YouTube comment say about the claim the video examines?', criteria: rules.stances } }
+          });
+          const answer = answers.stance;
+          if (rules.stances[answer?.choice]) await this.db.setCommentStance(comment.commentId, answer.choice, Number(answer.confidence ?? null));
+        } catch (error) {
+          this.logger.warn(`Comment stance failed for ${comment.commentId}: ${error.message.slice(0, 120)}`);
+        }
+      }
+    }));
+    const persuasion = persuasionOf(await this.db.listClassifiedComments(videoId), videoId, rules);
+    await this.db.saveEngagementInsight({ videoId, persuasion });
+    return persuasion;
   }
 
   async defaultListCommentThreads({ videoId, pageToken }) {
@@ -251,7 +337,7 @@ Comments: ${JSON.stringify(payload)}`;
       try {
         const response = await this.aiTextService.generateText(
           this.buildAnalysisPrompt(comments),
-          { maxTokens: 3000, temperature: 0.2 }
+          { maxTokens: 3000, temperature: 0.2, purpose: 'comment_analysis' }
         );
         const parsed = this.parseAIJsonResponse(response);
         if (!parsed) throw new Error('The analysis response was not valid JSON');
@@ -369,6 +455,8 @@ Comments: ${JSON.stringify(payload)}`;
         results.synced++;
         if (outcome.fetched > 0) {
           await this.analyzeVideo(videoId);
+          // React mode measures the stances the comments take (react profile `audience`).
+          if (isReactMode()) await this.classifyStances(videoId, video.title).catch(error => this.logger.warn(`Persuasion measure failed for ${videoId}: ${error.message}`));
           results.analyzed++;
         }
       } catch (error) {
@@ -433,7 +521,7 @@ Comments: ${JSON.stringify(payload)}`;
     const profile = await this.db.getChannelProfile();
     const response = await this.aiTextService.generateText(
       this.buildDraftPrompt(targets, profile, insight.title),
-      { maxTokens: 2500, temperature: 0.6 }
+      { maxTokens: 2500, temperature: 0.6, purpose: 'comment_replies' }
     );
     const entries = this.parseAIJsonResponse(response);
     const byId = new Map(targets.map(comment => [comment.commentId, comment]));
@@ -579,4 +667,4 @@ Comments: ${JSON.stringify(payload)}`;
   }
 }
 
-module.exports = { AudienceEngagementService };
+module.exports = { AudienceEngagementService, persuasionOf, audienceRules };

@@ -1,11 +1,92 @@
 const fs = require('fs').promises;
 const axios = require('axios');
 const { Logger } = require('./logger');
+const { parseChapters, validateChapters } = require('./chapters');
+const { hasSubscribeCall } = require('./subscribe-cta');
+const { confidenceThreshold } = require('./expert-review-service');
+const jevClient = require('./jev');
+const { isVertical, MAX_SHORT_SECONDS } = require('./vertical-short');
+
+// The spoken sentences of a script (hook, sections, call to action).
+function spokenSentences(script = {}) {
+  const sections = script.mainContent?.sections || [];
+  return [script.hook?.text, ...sections.flatMap(section => (Array.isArray(section.content) ? section.content : [section.content])), script.callToAction?.subscribe]
+    .filter(text => typeof text === 'string' && text.trim())
+    .flatMap(text => text.split(/(?<=[.!?…])\s+/))
+    .map(sentence => sentence.trim())
+    .filter(sentence => sentence.length >= 12);
+}
 
 class OperatorService {
-  constructor(db) {
+  constructor(db, options = {}) {
     this.db = db;
     this.logger = new Logger('OperatorService');
+    this.jev = options.jev || jevClient;
+  }
+
+  // Jev approves a reaction in place of the operator (REACTIVE_APPROVAL=jev, the default): the facts were
+  // verified by the fact-check and the tone by the tone guard (both blocking checks), and every passage quoted from the
+  // examined video must be represented faithfully by the answer. Null when Jev is off or REACTIVE_APPROVAL=human: the
+  // operator approves.
+  async reactiveApproval(production) {
+    if (!this.jev?.enabled?.() || String(process.env.REACTIVE_APPROVAL || 'jev').trim().toLowerCase() !== 'jev') return null;
+    const passages = production.strategy?.examinedVideo?.passages || [];
+    if (!passages.length) return { approved: false, reasons: ['aucun passage de la vidéo examinée à confronter à la réponse'], fidelity: [] };
+    const answer = spokenSentences(production.script).join(' ').slice(0, 60000);
+    const fidelity = [];
+    for (const passage of passages) {
+      const answers = await this.jev.ask({
+        purpose: 'jev_approval',
+        state: { quotedPassage: passage.text, answer },
+        questions: {
+          faithful: {
+            type: 'noul',
+            instructions: 'Does the answer quote or describe this passage of the examined video faithfully, without changing its meaning or taking it out of context?',
+            criteria: {
+              true: 'Faithful: the same words or the same meaning, in context',
+              false: 'Left out, distorted, exaggerated, out of context, or credited with something it does not say'
+            }
+          }
+        }
+      });
+      fidelity.push({ passage: passage.text, probability: Number(answers.faithful?.noul ?? 0) });
+    }
+    const weak = fidelity.filter(item => item.probability < 0.8);
+    return {
+      approved: weak.length === 0,
+      fidelity,
+      reasons: weak.map(item => `citation peut-être déformée ou absente : « ${item.passage.slice(0, 160)} » (${item.probability})`)
+    };
+  }
+
+  // An answer to a named video must examine claims, never attack people: Jev reads every spoken sentence and returns
+  // those that insult, label or attribute bad motives to a person or a group. Null when Jev is off.
+  async personalAttacks(script) {
+    if (!this.jev?.enabled?.()) return null;
+    const sentences = spokenSentences(script);
+    const flagged = [];
+    let next = 0;
+    await Promise.all(Array.from({ length: Math.min(6, sentences.length) }, async () => {
+      while (next < sentences.length) {
+        const sentence = sentences[next++];
+        const answers = await this.jev.ask({
+          purpose: 'tone_guard',
+          state: { sentence },
+          questions: {
+            attack: {
+              type: 'noul',
+              instructions: 'Does this sentence attack a person or a group rather than discuss a claim?',
+              criteria: {
+                true: 'It insults, mocks, labels (liar, crook, fraud...) or attributes bad motives to a person, an audience or a community',
+                false: 'It quotes, examines or explains a claim, a text or facts'
+              }
+            }
+          }
+        });
+        if (Number(answers.attack?.noul ?? 0) >= 0.7) flagged.push(sentence);
+      }
+    }));
+    return flagged;
   }
 
   async runQualityChecks(production, profile = {}) {
@@ -27,13 +108,42 @@ class OperatorService {
         tags.length >= 3 ? `${tags.length} tags provided` : 'Add at least 3 relevant tags', false),
       this.check('script', script.length >= 200,
         script.length >= 200 ? 'Script content is present' : 'Script is missing or unusually short'),
-      this.check('thumbnail', Boolean(thumbnail?.path),
-        thumbnail?.path ? 'Thumbnail asset is present' : 'Thumbnail asset is missing', false),
+      this.check('thumbnail', Boolean(thumbnail?.path) || isVertical(finalVideo),
+        isVertical(finalVideo) ? 'A Short needs no thumbnail' : thumbnail?.path ? 'Thumbnail asset is present' : 'Thumbnail asset is missing', false),
       this.check('video', Boolean(finalVideo?.path && !finalVideo?.simulated),
         finalVideo?.simulated
           ? 'Only a simulated video was produced'
           : finalVideo?.path ? 'Final MP4 is ready' : 'Final MP4 is missing')
     ];
+
+    // YouTube only shows chapters that follow its rules; the description must list them.
+    const chapters = parseChapters(description);
+    const knownChapters = Array.isArray(production.seo?.chapters) ? production.seo.chapters : [];
+    const videoSeconds = Number(finalVideo?.duration) ||
+      (production.scenes || []).reduce((sum, scene) => sum + (Number(scene.duration) || 0), 0) ||
+      Number(knownChapters[knownChapters.length - 1]?.end) || null;
+    if (isVertical(finalVideo)) {
+      // A Short has no chapters, and YouTube only counts a vertical video of three minutes or less as a Short.
+      const seconds = Number(finalVideo.duration) || videoSeconds || 0;
+      checks.push(this.check('short_duration', seconds > 0 && seconds <= MAX_SHORT_SECONDS,
+        seconds > 0 && seconds <= MAX_SHORT_SECONDS
+          ? `The Short lasts ${Math.round(seconds)} s (at most ${MAX_SHORT_SECONDS})`
+          : `The Short lasts ${Math.round(seconds)} s: YouTube would not show it as a Short (at most ${MAX_SHORT_SECONDS} s)`));
+    } else {
+      const chapterErrors = validateChapters(chapters, videoSeconds);
+      checks.push(this.check('chapters_valid', chapterErrors.length === 0,
+        chapterErrors.length === 0
+          ? `${chapters.length} chapters listed from 00:00, each at least 10 seconds long`
+          : `The description's chapters would not show on YouTube: ${chapterErrors.join('; ')}`));
+    }
+
+    // Asking to subscribe is mandatory, out loud at the end of the video and in the description.
+    const closing = (production.scenes || []).find(scene => /^call to action$/i.test(String(scene.label || '').trim()))?.scriptText ||
+      production.script?.callToAction?.subscribe || production.script?.cta || '';
+    checks.push(this.check('subscribe_cta_spoken', hasSubscribeCall(closing),
+      hasSubscribeCall(closing) ? 'The closing narration asks the viewer to subscribe' : 'The closing narration never asks the viewer to subscribe'));
+    checks.push(this.check('subscribe_cta_description', hasSubscribeCall(description),
+      hasSubscribeCall(description) ? 'The description asks the viewer to subscribe' : 'The description has no subscribe line'));
 
     const topic = String(production.strategy?.topic || '').trim();
     if (topic) {
@@ -98,6 +208,43 @@ class OperatorService {
         : provenance.status === 'not_required'
           ? 'No externally verifiable factual claims were declared'
           : `${unresolved} factual claim${unresolved === 1 ? '' : 's'} still require evidence review`));
+
+    // A reaction names the video it answers: the answer must not attack its author or a community.
+    if (production.strategy?.origin === 'reactive') {
+      try {
+        const attacks = await this.personalAttacks(production.script);
+        if (attacks) {
+          checks.push(this.check('respectful_tone', attacks.length === 0,
+            attacks.length
+              ? `${attacks.length} sentence${attacks.length === 1 ? '' : 's'} attack a person or a group rather than a claim: ${attacks.slice(0, 3).map(sentence => `« ${sentence} »`).join(' ')}`.slice(0, 1000)
+              : 'Every spoken sentence examines claims, not people'));
+        }
+      } catch (error) {
+        checks.push(this.check('respectful_tone', false, `The tone check could not run (${error.message.slice(0, 120)}); run it again before approval`));
+      }
+    }
+
+    // A highly specialised script is only published once a human expert has approved it.
+    const expert = production.script?.expertReview;
+    if (expert?.required) {
+      const approved = expert.status === 'approved';
+      checks.push(this.check('expert_review', approved,
+        approved
+          ? `Script approved by an expert reviewer (${expert.domain || 'specialised subject'})`
+          : `The script needs an expert review (${expert.domain || 'specialised subject'}) before approval`));
+    }
+    // Specialised passages the model was confident enough in to pass without an expert: shown to the approver.
+    const autoValidated = expert?.autoValidated || [];
+    if (autoValidated.length) {
+      checks.push(this.check('expert_confidence', true,
+        `Specialised passages validated without an expert (confidence above ${expert.confidenceThreshold ?? confidenceThreshold()}/10): ${autoValidated.map(item => `« ${item.excerpt} » ${item.confidence}/10`).join(' ; ')}`.slice(0, 1000), false));
+    }
+    // Imprecise figures the video assumes (no health stakes, not load-bearing): shown to the approver, never blocking.
+    const approximations = expert?.approximations || [];
+    if (approximations.length) {
+      checks.push(this.check('assumed_approximations', true,
+        `Assumed approximations, no health stakes: ${approximations.map(item => `« ${item.excerpt} »`).join(' ; ')}`.slice(0, 1000), false));
+    }
 
     const discoverability = production.discoverability;
     if (discoverability) {
@@ -176,4 +323,4 @@ class OperatorService {
   }
 }
 
-module.exports = { OperatorService };
+module.exports = { OperatorService, spokenSentences };

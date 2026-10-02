@@ -1,5 +1,7 @@
 const crypto = require('crypto');
 const { Logger } = require('./logger');
+const { scriptScenes } = require('./scene-repair-service');
+const { registerOf, isOpening } = require('./content-mode');
 
 class SceneRetentionEngine {
   constructor(db) {
@@ -27,7 +29,12 @@ class SceneRetentionEngine {
     if (!sceneMetrics.length) return null;
 
     const confidence = this.confidenceFor(points, exposure);
-    const summary = this.summarize(sceneMetrics, points);
+    const summary = {
+      ...this.summarize(sceneMetrics, points),
+      // A Short's scenes are a clip of the long video's: no turn there.
+      // A Short cut out of a video has no turn of its own; a Short that stands alone has its script's.
+      turn: context.shortClipId ? null : this.turnOf(points, timeline, context.script, durationSeconds)
+    };
     const snapshot = await this.db.saveRetentionSnapshot({
       videoId: retentionReport.videoId,
       productionId: context.productionId || null,
@@ -54,6 +61,36 @@ class SceneRetentionEngine {
       });
     }
     return snapshot;
+  }
+
+  // Where a two-part video turns from its opening to its main part, and the share of the audience watching 10 s before
+  // it that still watches 40 s after it (kept, in percent): whether viewers stay through the turn. Null without an
+  // opening part, or when the scenes no longer follow the script (reordered).
+  turnOf(points, timeline, script, durationSeconds) {
+    if (!script || !timeline.length) return null;
+    const blueprints = scriptScenes(script);
+    const registerAt = scene => {
+      const blueprint = blueprints[scene.position];
+      return blueprint && blueprint.label === scene.label ? blueprint.register : null;
+    };
+    if (timeline.some(scene => !registerAt(scene))) return null;
+    const index = timeline.findIndex((scene, position) => position > 0 && registerOf(registerAt(scene)) === 'main' &&
+      timeline.slice(0, position).some(previous => isOpening(registerAt(previous))));
+    if (index <= 0) return null;
+    const seconds = timeline[index].startSeconds;
+    const ratioAt = second => {
+      const target = Math.min(durationSeconds, Math.max(0, second)) / durationSeconds;
+      return points.reduce((best, point) => (Math.abs(point.elapsedRatio - target) < Math.abs(best.elapsedRatio - target) ? point : best)).audienceWatchRatio;
+    };
+    const before = ratioAt(seconds - 10);
+    const after = ratioAt(seconds + 40);
+    return {
+      seconds,
+      sceneLabel: timeline[index].label,
+      before: Number(before.toFixed(4)),
+      after: Number(after.toFixed(4)),
+      kept: before > 0 ? Math.round((after / before) * 1000) / 10 : null
+    };
   }
 
   normalizePoints(points) {

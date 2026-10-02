@@ -83,10 +83,24 @@ backup/
 # Generated content outputs
 data/assets/
 data/audio/
+# Audio-library tracks may not be redistributed
+data/music/
 data/captions/
 data/scripts/
+data/expert-reviews/
+data/ai-usage.jsonl
+data/site/
+data/site.lock
 data/videos/
 data/thumbnails/
 
 # Claude worktrees
 .claude/worktrees/
+
+# Local TTS environments
+.venv*/
+data/fonts/
+data/audio/samples/
+data/shorts/
+data/thumbnails/
+data/fonts/

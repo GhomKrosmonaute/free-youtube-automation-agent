@@ -50,6 +50,61 @@ npm start                   # http://localhost:3456
 
 On Linux or Windows, keep Ollama for text and add a free Gemini key for narration (`GEMINI_API_KEY`).
 
+## Tools added in this fork
+
+**Writing and voice**
+- **Claude Code as the text provider** (`TEXT_PROVIDER=claude-code`): scripts, planning, fact-checks and Shorts editing
+  run through a Claude subscription in headless mode. `npm run ai-usage` reports every call's purpose, tokens and cost.
+- **Local voices and images on a Mac** (`scripts/setup-local-engines.sh`): Kokoro or Chatterbox narration, Z-Image
+  illustrations, plus Azure and ElevenLabs voices. `npm run voices` lists them.
+- **Illustrated montage** (`VISUAL_MODE=illustrated`): one illustration per scene, word-timed captions, chapter cards,
+  insert cards (Wikipedia images, quotations, equations, scripture verses), a background music library mixed under the
+  voice, and chapters in the description timed on the narrated scenes.
+
+**Getting facts right**
+- **Automatic fact-check by web search** (`AUTO_FACT_CHECK`): every factual claim of a script is checked against
+  sources before publication; a video with an unverified claim waits for a human. The verified sources go into the
+  description.
+- **Expert review of specialised subjects** (`EXPERT_REVIEW`): passages about medicine, physics, biology and the like get
+  a confidence score; those under `EXPERT_REVIEW_CONFIDENCE` are sent, as a brief an expert can read, to a Discord
+  webhook (`EXPERT_REVIEW_WEBHOOK_URL`). Assumed approximations without health stakes are flagged rather than blocked.
+  `npm run expert` lists, approves or rejects them.
+- **Jev** (`TYPESAFE_API_KEY`, typesafe.ai): a cheap classifier for the many yes/no and multiple-choice decisions
+  (triage of specialised subjects, comment classification, tone checks), sparing Claude calls.
+
+**Publishing**
+- **Shorts from every video**: an AI editor picks self-contained passages and a critic reviews them; they are laid out
+  natively in 9:16 and published after the video, also on TikTok and Instagram Reels (`SOCIAL_PLATFORMS`).
+- **Continuous production** (`npm run auto`): the agent plans, produces and publishes on its own, with human approval
+  unless `--autonome`. Interrupted videos are resumed before anything new is planned.
+- **Public verification site** (`SITE_BASE_URL`, `SITE_REPO`, `npm run site`): one page per published video with its
+  verified facts and sources, how it was reviewed and its corrections (`npm run errata`), pushed to GitHub Pages and
+  linked from the description. `SITE_FEEDS=on` adds RSS feeds and a static JSON API (`api/v1/`).
+- **Real analytics**: views and audience retention per scene from the YouTube Analytics API feed the learning loop.
+
+### React mode (`CONTENT_MODE=react`)
+
+The default mode (`standard`) makes explainer videos. React mode also reacts to what other channels publish:
+
+- **Watched channels** (`npm run reactive -- watch @handle`, at most `WATCH_MAX_CHANNELS`): their new videos are read
+  every five minutes. When one makes a claim the channel answers, the answer is a vertical Short that names the video
+  and quotes it word for word (text, never footage), or a series of Shorts joined into one 16:9 video when its
+  arguments need it. Jev approves an answer when every fact is verified, every quotation is faithful and no sentence
+  attacks a person (`REACTIVE_APPROVAL`).
+- **A react profile** (`config/react-profile.js`, see `config/react-profile.example.js`) says what the channel reacts
+  to and how; every field is optional:
+  - two-part videos: an opening, then the main part, each with its own look and music;
+  - a verdict scale for the claim each video examines, shown on the public site;
+  - a catalog of techniques, taught by one "lesson" video in N and tagged on examined claims;
+  - topic gaps (`npm run gaps`): claims many people watch being supported and few watch being answered;
+  - a weekly web search for channels to watch, by category;
+  - the stances comments take (persuasion), measured by Jev, which feed the learning loop and score the watched
+    channels;
+  - the rules for scripts, titles, thumbnails, descriptions, Shorts and the site's wording, and the look.
+
+Without a profile, react mode answers the new videos of the channels you watch, and nothing more. An answer is about
+what a video says, never about who made it.
+
 ## What's new on master
 
 - **v2.10.0 is now on master:** DarkzSEO discoverability audits, controlled growth experiments, and outcome-aware channel operation are available together in the approval-first workflow.

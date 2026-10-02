@@ -54,6 +54,20 @@ class CredentialManager {
     await fs.writeFile(this.tokensPath, JSON.stringify(this.tokens, null, 2));
   }
 
+  // Rewrites one platform's tokens on top of what is on disk, so a refresh never drops another platform's login.
+  async saveTokenFor(platform, value) {
+    let onDisk = {};
+    try {
+      onDisk = JSON.parse(await fs.readFile(this.tokensPath, 'utf8'));
+    } catch (_error) {
+      onDisk = {};
+    }
+    onDisk[platform] = value;
+    this.tokens = { ...this.tokens, ...onDisk };
+    await fs.mkdir(path.dirname(this.tokensPath), { recursive: true });
+    await fs.writeFile(this.tokensPath, JSON.stringify(onDisk, null, 2));
+  }
+
   // YouTube API Authentication
   async setupYouTubeCredentials() {
     console.log(chalk.cyan('\n🎬 YouTube API Setup'));
@@ -159,6 +173,184 @@ class CredentialManager {
   hasYouTubeScope(scope) {
     const granted = String(this.tokens?.youtube?.scope || '');
     return granted.split(/\s+/).includes(scope);
+  }
+
+  // TikTok Content Posting API (Shorts copies). Desktop Login Kit: loopback redirect URI and PKCE.
+  async setupTikTokCredentials() {
+    console.log(chalk.cyan('\n🎵 TikTok Content Posting API Setup'));
+    console.log(chalk.gray('Create an app at https://developers.tiktok.com/ with Login Kit (Desktop) and the Content Posting API'));
+
+    const current = this.credentials.tiktok || {};
+    const answers = await inquirer.prompt([
+      {
+        type: 'input',
+        name: 'clientKey',
+        message: 'Enter your TikTok client key:',
+        default: current.client_key,
+        validate: input => input.length > 0 || 'Client key is required'
+      },
+      {
+        type: 'password',
+        name: 'clientSecret',
+        message: 'Enter your TikTok client secret:',
+        validate: input => input.length > 0 || 'Client secret is required'
+      },
+      {
+        type: 'input',
+        name: 'redirectUri',
+        message: 'Redirect URI registered in the app:',
+        default: current.redirect_uri || 'http://127.0.0.1:8765/tiktok/callback/'
+      },
+      {
+        type: 'input',
+        name: 'username',
+        message: 'TikTok @username (optional, used to build post links):',
+        default: current.username || ''
+      }
+    ]);
+
+    this.credentials.tiktok = {
+      client_key: answers.clientKey.trim(),
+      client_secret: answers.clientSecret.trim(),
+      redirect_uri: answers.redirectUri.trim(),
+      username: answers.username.trim().replace(/^@/, '') || undefined
+    };
+    await this.saveCredentials();
+    await this.authenticateTikTok();
+    console.log(chalk.green('✅ TikTok credentials configured successfully!'));
+  }
+
+  async authenticateTikTok() {
+    const crypto = require('crypto');
+    const { pkcePair, authorizeUrl, exchangeCode, DEFAULT_SCOPES } = require('./social-publishers/tiktok');
+    const credentials = this.credentials.tiktok;
+    const scopes = String(process.env.TIKTOK_SCOPES || DEFAULT_SCOPES.join(',')).split(',').map(scope => scope.trim()).filter(Boolean);
+    const state = crypto.randomBytes(16).toString('hex');
+    const { verifier, challenge } = pkcePair();
+    const url = authorizeUrl({ clientKey: credentials.client_key, redirectUri: credentials.redirect_uri, scopes, state, codeChallenge: challenge });
+
+    console.log(chalk.cyan('\n🔗 Open this URL and authorize the app with the channel\'s TikTok account:'));
+    console.log(chalk.blue(url));
+
+    const redirect = new URL(credentials.redirect_uri);
+    const loopback = redirect.protocol === 'http:' && ['localhost', '127.0.0.1'].includes(redirect.hostname) && redirect.port;
+    const received = loopback
+      ? await this.waitForLoopbackCode(redirect, state)
+      : await this.promptForCode(state);
+
+    const tokens = await exchangeCode({ credentials, code: received, codeVerifier: verifier });
+    await this.saveTokenFor('tiktok', tokens);
+    console.log(chalk.green(`✅ TikTok authentication completed (scopes: ${tokens.scope || scopes.join(',')})`));
+  }
+
+  // Serves the redirect URI on the loopback interface until TikTok sends the code back (5 minutes at most).
+  waitForLoopbackCode(redirect, state) {
+    const http = require('http');
+    return new Promise((resolve, reject) => {
+      const server = http.createServer((req, res) => {
+        const url = new URL(req.url, `${redirect.protocol}//${redirect.host}`);
+        if (url.pathname.replace(/\/$/, '') !== redirect.pathname.replace(/\/$/, '')) {
+          res.writeHead(404);
+          res.end();
+          return;
+        }
+        const code = url.searchParams.get('code');
+        const error = url.searchParams.get('error_description') || url.searchParams.get('error');
+        const valid = code && url.searchParams.get('state') === state;
+        res.writeHead(valid ? 200 : 400, { 'Content-Type': 'text/html; charset=utf-8' });
+        res.end(valid ? '<p>TikTok autorisé. Tu peux fermer cette fenêtre.</p>' : `<p>Échec de l'autorisation TikTok : ${error || 'réponse invalide'}</p>`);
+        clearTimeout(timer);
+        server.close();
+        if (valid) resolve(code);
+        else reject(new Error(`TikTok authorization failed: ${error || 'state mismatch or missing code'}`));
+      });
+      const timer = setTimeout(() => {
+        server.close();
+        reject(new Error('TikTok authorization timed out'));
+      }, 5 * 60 * 1000);
+      server.listen(Number(redirect.port), redirect.hostname);
+      console.log(chalk.gray(`Waiting for TikTok on ${redirect.origin}${redirect.pathname} ...`));
+    });
+  }
+
+  async promptForCode(state) {
+    const { answer } = await inquirer.prompt([{
+      type: 'input',
+      name: 'answer',
+      message: 'Paste the full URL you were redirected to (or just the code):',
+      validate: input => input.length > 0 || 'The redirected URL or the code is required'
+    }]);
+    if (!/^https?:\/\//i.test(answer.trim())) return decodeURIComponent(answer.trim());
+    const url = new URL(answer.trim());
+    if (url.searchParams.get('state') && url.searchParams.get('state') !== state) throw new Error('TikTok authorization state mismatch');
+    const code = url.searchParams.get('code');
+    if (!code) throw new Error('No authorization code in the redirected URL');
+    return code;
+  }
+
+  // Instagram Reels via the Instagram API with Instagram Login (Business or Creator account, no Facebook Page).
+  async setupInstagramCredentials() {
+    const axios = require('axios');
+    const { GRAPH_BASE, GRAPH_ROOT, ASSUMED_LIFETIME_MS } = require('./social-publishers/instagram');
+    console.log(chalk.cyan('\n📸 Instagram Reels Setup'));
+    console.log(chalk.gray('Meta app > Instagram > API setup with Instagram login > Generate access tokens for the channel account'));
+
+    const current = this.credentials.instagram || {};
+    const answers = await inquirer.prompt([
+      {
+        type: 'input',
+        name: 'appId',
+        message: 'Instagram app ID (optional):',
+        default: current.app_id || ''
+      },
+      {
+        type: 'password',
+        name: 'appSecret',
+        message: 'Instagram app secret (optional, turns a short-lived token into a 60-day one):'
+      },
+      {
+        type: 'password',
+        name: 'accessToken',
+        message: 'Paste the access token generated for the account:',
+        validate: input => input.length > 0 || 'Access token is required'
+      }
+    ]);
+
+    let accessToken = answers.accessToken.trim();
+    let expiresAt = Date.now() + ASSUMED_LIFETIME_MS;
+    const appSecret = answers.appSecret.trim() || current.app_secret;
+    if (appSecret) {
+      try {
+        const { data } = await axios.get(`${GRAPH_ROOT}/access_token`, {
+          params: { grant_type: 'ig_exchange_token', client_secret: appSecret, access_token: accessToken }
+        });
+        if (data?.access_token) {
+          accessToken = data.access_token;
+          expiresAt = Date.now() + Number(data.expires_in || 60 * 24 * 3600) * 1000;
+        }
+      } catch (_error) {
+        // Tokens generated in the dashboard are already long-lived: keep the pasted one.
+        console.log(chalk.gray('Token kept as pasted (already long-lived).'));
+      }
+    }
+
+    let profile;
+    try {
+      ({ data: profile } = await axios.get(`${GRAPH_BASE}/me`, { params: { fields: 'user_id,username', access_token: accessToken } }));
+    } catch (error) {
+      throw new Error(`Instagram rejected the token: ${error.response?.data?.error?.message || error.message}`);
+    }
+    if (!profile?.user_id) throw new Error('Instagram returned no account id for this token');
+
+    this.credentials.instagram = { app_id: answers.appId.trim() || undefined, app_secret: appSecret || undefined };
+    await this.saveCredentials();
+    await this.saveTokenFor('instagram', {
+      access_token: accessToken,
+      user_id: String(profile.user_id),
+      username: profile.username || null,
+      expires_at: expiresAt
+    });
+    console.log(chalk.green(`✅ Instagram configured for @${profile.username || profile.user_id}`));
   }
 
   // OpenAI API Setup
@@ -518,7 +710,8 @@ class CredentialManager {
     }
 
     // Environment-variable based configuration (see utils/ai-text-service.js)
-    const envKeys = [...Object.values(PROVIDERS).map(p => p.envKey), 'GEMINI_API_KEY'];
+    if (String(process.env.TEXT_PROVIDER || '').toLowerCase() === 'claude-code') return true;
+    const envKeys = [...Object.values(PROVIDERS).map(p => p.envKey), 'GEMINI_API_KEY', 'ANTHROPIC_API_KEY'];
     return envKeys.some(key => process.env[key]);
   }
 
@@ -530,7 +723,7 @@ class CredentialManager {
     }
 
     if (!this.hasAITextProvider()) {
-      missing.push('an AI provider (OpenAI, Gemini, OpenRouter, Kimi, MiMo, GLM, or local Ollama)');
+      missing.push('an AI provider (Claude, OpenAI, Gemini, OpenRouter, Kimi, MiMo, GLM, or local Ollama)');
     }
 
     return missing;
@@ -712,10 +905,17 @@ if (require.main === module) {
   const credentialManager = new CredentialManager();
   
   const args = process.argv.slice(2);
-  if (args.includes('setup')) {
+  const target = args[args.indexOf('setup') + 1];
+  const platformSetups = {
+    tiktok: () => credentialManager.setupTikTokCredentials(),
+    instagram: () => credentialManager.setupInstagramCredentials()
+  };
+  if (args.includes('setup') && platformSetups[target]) {
+    credentialManager.initialize().then(platformSetups[target]).catch(console.error);
+  } else if (args.includes('setup')) {
     credentialManager.runSetupWizard().catch(console.error);
   } else {
-    console.log('Usage: node credential-manager.js setup');
+    console.log('Usage: node credential-manager.js setup [tiktok|instagram]');
   }
 }
 

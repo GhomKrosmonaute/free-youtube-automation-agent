@@ -500,6 +500,7 @@ label:has(input:disabled) > span { color: var(--muted); }
 .scene-boundary { stroke: rgba(255, 255, 255, .13); stroke-width: 1; stroke-dasharray: 4 5; }
 .retention-grid-line { stroke: rgba(255, 255, 255, .08); stroke-width: 1; }
 .retention-line { fill: none; stroke: var(--red); stroke-width: 3.5; stroke-linecap: round; stroke-linejoin: round; filter: drop-shadow(0 4px 10px rgba(255, 77, 94, .35)); }
+.retention-turn { stroke: currentColor; stroke-width: 2; stroke-dasharray: 6 5; opacity: .7; }
 
 .retention-scene-list { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
 .retention-scene { display: grid; gap: 12px; min-width: 0; border: 1px solid var(--line); border-radius: var(--radius); padding: 13px; background: var(--surface-2); transition: border-color .15s ease; }

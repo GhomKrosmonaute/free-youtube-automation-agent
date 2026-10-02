@@ -79,10 +79,14 @@ class OAuthServer {
 
     const { tokens } = await oauth2Client.getToken(code);
     
-    // Save tokens
-    const tokenData = {
-      youtube: tokens
-    };
+    // Save tokens next to the other platforms' logins (TikTok, Instagram) instead of replacing the file
+    let tokenData = {};
+    try {
+      tokenData = JSON.parse(fs.readFileSync(tokensPath, 'utf8'));
+    } catch (_error) {
+      tokenData = {};
+    }
+    tokenData.youtube = tokens;
     
     fs.writeFileSync(tokensPath, JSON.stringify(tokenData, null, 2));
     console.log(chalk.green('✅ Tokens saved successfully!'));

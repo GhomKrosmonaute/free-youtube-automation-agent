@@ -103,11 +103,8 @@ class AnalyticsOptimizationAgent {
       
       // Save to database
       await this.db.saveAnalyticsReport(performanceReport);
-      performanceReport.learningSnapshot = await this.learning.capture(
-        performanceReport,
-        context,
-        measurementWindow
-      );
+      // Retention first: the share of the audience kept after the turn of a two-part video joins the performance
+      // snapshot, with the comments' goal stance rate (react mode).
       if (retention.available) {
         performanceReport.retentionSnapshot = await this.learning.captureRetention(
           {
@@ -124,6 +121,18 @@ class AnalyticsOptimizationAgent {
           }
         );
       }
+      const engagement = await this.db.getEngagementInsight?.(videoId).catch(() => null);
+      performanceReport.learningSnapshot = await this.learning.capture(
+        performanceReport,
+        {
+          ...context,
+          persuasion: {
+            goalRate: engagement?.persuasion?.goalRate ?? null,
+            turnKept: performanceReport.retentionSnapshot?.summary?.turn?.kept ?? null
+          }
+        },
+        measurementWindow
+      );
       
       this.logger.info(`Analysis complete. Performance score: ${performanceReport.performance.score}/100`);
       return performanceReport;
@@ -198,20 +207,22 @@ class AnalyticsOptimizationAgent {
     }
   }
 
+  // Impressions and click-through rate are not metrics of the YouTube Analytics API (asking for them rejects the whole
+  // query): they only come in the YouTube Reporting API's bulk reports. They are reported as unavailable (null).
   async getViewsAnalytics(videoId, startDate, endDate) {
     const response = await this.youtubeAnalytics.reports.query({
       ids: 'channel==MINE',
       startDate,
       endDate,
-      metrics: 'views,impressions,impressionClickThroughRate',
+      metrics: 'views',
       dimensions: 'day',
       filters: `video==${videoId}`
     });
     
     return {
       totalViews: response.data.rows?.reduce((sum, row) => sum + row[1], 0) || 0,
-      totalImpressions: response.data.rows?.reduce((sum, row) => sum + row[2], 0) || 0,
-      averageCTR: this.calculateAverage(response.data.rows?.map(row => row[3]) || []),
+      totalImpressions: null,
+      averageCTR: null,
       dailyData: response.data.rows || []
     };
   }
@@ -367,35 +378,15 @@ class AnalyticsOptimizationAgent {
     };
   }
 
-  async analyzeThumbnailPerformance(videoId, period = null) {
-    // Analyze thumbnail click-through rate and impressions
-    try {
-      const response = await this.youtubeAnalytics.reports.query({
-        ids: 'channel==MINE',
-        startDate: period?.startDate || new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString().split('T')[0],
-        endDate: period?.endDate || new Date().toISOString().split('T')[0],
-        metrics: 'impressions,impressionClickThroughRate',
-        filters: `video==${videoId}`
-      });
-      
-      const data = response.data.rows?.[0] || [0, 0];
-      
-      const ctr = data[1] || 0;
-      
-      return {
-        impressions: data[0] || 0,
-        clickThroughRate: ctr,
-        ctrQuality: this.assessCTRQuality(ctr),
-        recommendations: this.generateThumbnailRecommendations(ctr)
-      };
-    } catch (error) {
-      return {
-        impressions: 0,
-        clickThroughRate: 0,
-        ctrQuality: 'unknown',
-        recommendations: ['Unable to analyze thumbnail performance']
-      };
-    }
+  // Thumbnail impressions and click-through rate are not available from the YouTube Analytics API (only from the
+  // YouTube Reporting API's bulk reports): reported as unknown rather than as zero.
+  async analyzeThumbnailPerformance(_videoId, _period = null) {
+    return {
+      impressions: null,
+      clickThroughRate: null,
+      ctrQuality: 'unknown',
+      recommendations: ['Impressions and click-through rate are not available from the YouTube Analytics API']
+    };
   }
 
   async analyzeSEOPerformance(videoDetails, analytics) {
@@ -465,7 +456,9 @@ class AnalyticsOptimizationAgent {
     }
     
     // Thumbnail insights
-    if (thumbnailMetrics.clickThroughRate > 8) {
+    if (thumbnailMetrics.clickThroughRate === null || thumbnailMetrics.clickThroughRate === undefined) {
+      // Unknown CTR: no thumbnail verdict.
+    } else if (thumbnailMetrics.clickThroughRate > 8) {
       insights.push({
         type: 'success',
         category: 'thumbnail',
@@ -540,10 +533,13 @@ class AnalyticsOptimizationAgent {
     score += engagementScore;
     maxScore += 25;
     
-    // CTR score (20 points max)
-    const ctrScore = Math.min(20, analytics.views.averageCTR * 2);
-    score += ctrScore;
-    maxScore += 20;
+    // CTR score (20 points max), left out of the score when the CTR is unknown
+    const ctrKnown = Number.isFinite(Number(analytics.views.averageCTR)) && analytics.views.averageCTR !== null;
+    const ctrScore = ctrKnown ? Math.min(20, analytics.views.averageCTR * 2) : 0;
+    if (ctrKnown) {
+      score += ctrScore;
+      maxScore += 20;
+    }
     
     const finalScore = Math.round((score / maxScore) * 100);
     

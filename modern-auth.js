@@ -132,8 +132,14 @@ class ModernAuth {
           try {
             const { tokens } = await oauth2Client.getToken(code);
             
-            // Save tokens
-            const tokenData = { youtube: tokens };
+            // Save tokens next to the other platforms' logins (TikTok, Instagram) instead of replacing the file
+            let tokenData = {};
+            try {
+              tokenData = JSON.parse(fs.readFileSync(this.tokensPath, 'utf8'));
+            } catch (_error) {
+              tokenData = {};
+            }
+            tokenData.youtube = tokens;
             fs.writeFileSync(this.tokensPath, JSON.stringify(tokenData, null, 2));
             
             res.writeHead(200, { 'Content-Type': 'text/html' });

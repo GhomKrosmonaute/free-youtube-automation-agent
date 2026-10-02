@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Added Claude Code as a text provider (`TEXT_PROVIDER=claude-code`), with the purpose, tokens and cost of every call (`npm run ai-usage`)
+- Added local voices and illustrations on a Mac (Kokoro, Chatterbox, Z-Image; `scripts/setup-local-engines.sh`), Azure and ElevenLabs voices, and an illustrated montage: one illustration per scene, word-timed captions, insert cards, a music library mixed under the voice, chapters timed on the narrated scenes
+- Added an automatic fact-check by web search before publication, and expert review of specialised subjects with per-passage confidence, assumed approximations and a brief an expert can read, sent to Discord (`npm run expert`)
+- Added Jev (typesafe.ai) as a classifier for yes/no and choice decisions
+- Added Shorts cut out of every video by an AI editor and a critic, laid out natively in 9:16, also published on TikTok and Instagram Reels
+- Added continuous production (`npm run auto`) that resumes interrupted videos before planning new ones
+- Added a public verification site on GitHub Pages (`npm run site`, `npm run errata`), with optional RSS feeds and a static JSON API (`SITE_FEEDS`)
+- Fixed analytics: views and retention per scene now come from the YouTube Analytics API and feed the learning loop
+- Added `CONTENT_MODE`: `standard` (explainer videos) or `react`, where the channel also reacts to the new videos of watched channels with vertical Shorts (a series joined into one 16:9 video when needed); a react profile (`config/react-profile.example.js`) can add two-part videos, a verdict scale, techniques and lessons, topic gaps, channel discovery, comment stances and the channel's own rules and look
 - Bundled the DarkzSEO-compatible content audit so the preflight no longer depends on the unpublished 1.4 Python package; external 1.4+ checkouts remain opt-in through `DARKZSEO_PATH`
 - Fixed regenerated narration timing, CTA metadata and template-placeholder speech leaks, configured visual-style propagation, and null manual strategy contexts
 - Added explicit reschedule, publish-now, and delete-schedule controls while keeping generated content when a schedule is removed

@@ -5,8 +5,11 @@ const path = require('path');
 const axios = require('axios');
 const sharp = require('sharp');
 const { Logger } = require('./logger');
-const { runFFmpeg, checkFFmpeg, ffmpegInstallHint } = require('./ffmpeg');
+const { runFFmpeg, checkFFmpeg, ffmpegInstallHint, getMediaDuration } = require('./ffmpeg');
 const { MediaGenerationService } = require('./media-generation-service');
+const elevenLabs = require('./elevenlabs-tts');
+const azureTts = require('./azure-tts');
+const { clearWordTimings } = require('./narration-timing');
 
 class AIVideoGenerator {
   constructor(credentials, options = {}) {
@@ -46,18 +49,30 @@ class AIVideoGenerator {
       }
     }
     
-    // ElevenLabs configuration
-    this.elevenLabsApiKey = resolvedCredentials.elevenLabs?.apiKey || process.env.ELEVENLABS_API_KEY;
-    this.elevenLabsVoiceId = resolvedCredentials.elevenLabs?.voiceId || process.env.ELEVENLABS_VOICE_ID;
-    this.elevenLabsModel = process.env.ELEVENLABS_TTS_MODEL || 'eleven_v3';
+    // ElevenLabs (paid, studio quality, word timestamps). Selected with TTS_PROVIDER=elevenlabs, or used
+    // when its keys are set and no local engine is selected. Env vars win over stored credentials.
+    this.elevenLabsAuth = {
+      apiKey: process.env.ELEVENLABS_API_KEY || resolvedCredentials.elevenLabs?.apiKey || null,
+      voiceId: process.env.ELEVENLABS_VOICE_ID || resolvedCredentials.elevenLabs?.voiceId || null
+    };
+    this.elevenLabsSelected = String(process.env.TTS_PROVIDER || '').toLowerCase() === 'elevenlabs';
     
-    // Azure Speech configuration
-    this.azureSpeechKey = resolvedCredentials.azure?.speechKey || process.env.AZURE_SPEECH_KEY;
-    this.azureSpeechRegion = resolvedCredentials.azure?.speechRegion || process.env.AZURE_SPEECH_REGION;
+    // Azure Speech (free F0 tier: 0.5 M characters/month of neural voices, word timings). Selected with
+    // TTS_PROVIDER=azure. Env vars win over stored credentials (credential manager or legacy shape).
+    this.azureAuth = {
+      key: process.env.AZURE_SPEECH_KEY || resolvedCredentials.azureSpeech?.subscriptionKey || resolvedCredentials.azure?.speechKey || null,
+      region: process.env.AZURE_SPEECH_REGION || resolvedCredentials.azureSpeech?.region || resolvedCredentials.azure?.speechRegion || null,
+      voice: process.env.AZURE_SPEECH_VOICE || resolvedCredentials.azureSpeech?.voice || null
+    };
+    this.azureSelected = String(process.env.TTS_PROVIDER || '').toLowerCase() === 'azure';
 
     // Local macOS narration (free, offline) via the built-in `say` command, converted with FFmpeg.
     // Enabled with TTS_PROVIDER=macos_say; optional TTS_VOICE (e.g. "Thomas", "Eddy (Français (France))").
     this.localTTSEnabled = process.platform === 'darwin' && String(process.env.TTS_PROVIDER || '').toLowerCase() === 'macos_say';
+    // Open-source neural narration through scripts/tts/tts_bridge.py (Kokoro: fast, Apache-2.0; Chatterbox: higher quality, MIT).
+    this.pythonTTSEngine = ['kokoro', 'chatterbox'].includes(String(process.env.TTS_PROVIDER || '').toLowerCase())
+      ? String(process.env.TTS_PROVIDER).toLowerCase()
+      : null;
     this.localTTSVoice = process.env.TTS_VOICE || 'Thomas';
     this.localTTSRate = Number(process.env.TTS_RATE || 175);
     this.mediaGeneration = options.mediaGeneration || (this.db
@@ -65,22 +80,42 @@ class AIVideoGenerator {
       : null);
   }
 
-  async generateTTSAudio(text, outputPath) {
+  // options.previousText / options.nextText: neighbouring narration, used by ElevenLabs for continuous prosody.
+  async generateTTSAudio(text, outputPath, options = {}) {
     this.logger.info('Generating TTS audio...');
     this.lastNarrationResult = null;
     let provider = 'simulation';
     let model = null;
+    let cost = null;
 
     try {
       let generatedPath;
-      if (this.localTTSEnabled) {
+      // Word timings from a previous take would no longer match this audio.
+      await clearWordTimings(outputPath);
+      if (this.elevenLabsSelected || (!this.pythonTTSEngine && !this.localTTSEnabled && this.elevenLabsAuth.apiKey && this.elevenLabsAuth.voiceId)) {
+        provider = 'elevenlabs';
+        const result = await elevenLabs.synthesize(text, outputPath, { ...options, ...this.elevenLabsAuth });
+        model = result.model;
+        cost = result.cost;
+        generatedPath = result.path;
+        this.logger.info(`ElevenLabs narration complete (${result.characters} characters, ~$${result.cost.amount})`);
+      } else if (this.azureSelected) {
+        provider = 'azure';
+        const result = await azureTts.synthesize(text, outputPath, this.azureAuth);
+        model = result.model;
+        cost = result.cost;
+        generatedPath = result.path;
+        this.logger.info(`Azure narration complete (${result.characters} characters, voice ${result.model})`);
+      } else if (this.pythonTTSEngine) {
+        provider = this.pythonTTSEngine;
+        model = this.pythonTTSEngine === 'kokoro'
+          ? `kokoro-82m:${process.env.TTS_VOICE || 'ff_siwis'}`
+          : `chatterbox-multilingual${process.env.TTS_REF_AUDIO ? ':cloned' : ''}`;
+        generatedPath = await this.generatePythonTTS(this.pythonTTSEngine, text, outputPath);
+      } else if (this.localTTSEnabled) {
         provider = 'macos_say';
         model = `say:${this.localTTSVoice}`;
         generatedPath = await this.generateLocalMacTTS(text, outputPath);
-      } else if (this.elevenLabsApiKey && this.elevenLabsVoiceId) {
-        provider = 'elevenlabs';
-        model = this.elevenLabsModel;
-        generatedPath = await this.generateElevenLabsTTS(text, outputPath);
       } else if (this.openai) {
         provider = 'openai';
         model = 'gpt-4o-mini-tts';
@@ -102,7 +137,7 @@ class AIVideoGenerator {
         externalTaskId: null,
         generatedAt: new Date().toISOString(),
         simulated: !usable,
-        cost: { provider, amount: null, currency: null, invoiceRequired: provider !== 'simulation' }
+        cost: { provider, amount: cost?.amount ?? null, currency: cost?.currency ?? null, invoiceRequired: provider !== 'simulation' }
       };
       return generatedPath;
     } catch (error) {
@@ -116,42 +151,42 @@ class AIVideoGenerator {
     }
   }
 
-  async generateElevenLabsTTS(text, outputPath) {
-    const url = `https://api.elevenlabs.io/v1/text-to-speech/${this.elevenLabsVoiceId}`;
-    
-    const data = {
-      text: text,
-      model_id: this.elevenLabsModel,
-      voice_settings: {
-        stability: 0.5,
-        similarity_boost: 0.8,
-        style: 0.0,
-        use_speaker_boost: true
-      }
-    };
 
-    const response = await axios({
-      method: 'POST',
-      url: url,
-      data: data,
-      headers: {
-        'Accept': 'audio/mpeg',
-        'Content-Type': 'application/json',
-        'xi-api-key': this.elevenLabsApiKey
-      },
-      responseType: 'stream'
-    });
-
-    const writer = require('fs').createWriteStream(outputPath);
-    response.data.pipe(writer);
-
-    return new Promise((resolve, reject) => {
-      writer.on('finish', () => {
-        this.logger.info('ElevenLabs TTS generation complete');
-        resolve(outputPath);
+  async generatePythonTTS(engine, text, outputPath) {
+    const { execFile } = require('child_process');
+    const { promisify } = require('util');
+    const execFileAsync = promisify(execFile);
+    const root = path.join(__dirname, '..');
+    const defaultPython = path.join(root, engine === 'kokoro' ? '.venv-tts' : '.venv-chatterbox', 'bin', 'python');
+    const python = process.env[`${engine.toUpperCase()}_PYTHON`] || process.env.TTS_PYTHON || defaultPython;
+    const bridge = path.join(root, 'scripts', 'tts', 'tts_bridge.py');
+    const base = outputPath.replace(/\.[a-z0-9]+$/i, '');
+    const textPath = `${base}.${engine}.txt`;
+    const wavPath = `${base}.${engine}.wav`;
+    const lang = process.env.CONTENT_LANGUAGE || 'en';
+    const args = [bridge, '--engine', engine, '--text-file', textPath, '--out', wavPath, '--lang', lang];
+    if (engine === 'kokoro') args.push('--voice', process.env.TTS_VOICE || (lang === 'fr' ? 'ff_siwis' : 'af_heart'), '--speed', String(process.env.TTS_SPEED || 1.0));
+    if (engine === 'chatterbox') {
+      if (process.env.TTS_REF_AUDIO) args.push('--ref-audio', process.env.TTS_REF_AUDIO);
+      if (process.env.TTS_EXAGGERATION) args.push('--exaggeration', process.env.TTS_EXAGGERATION);
+      if (process.env.TTS_CFG_WEIGHT) args.push('--cfg-weight', process.env.TTS_CFG_WEIGHT);
+    }
+    await fs.mkdir(path.dirname(outputPath), { recursive: true });
+    await fs.writeFile(textPath, text, 'utf8');
+    try {
+      const { stdout } = await execFileAsync(python, args, {
+        maxBuffer: 8 * 1024 * 1024,
+        timeout: Number(process.env.TTS_TIMEOUT_MS || 60 * 60 * 1000),
+        env: { ...process.env, PYTHONUNBUFFERED: '1', TOKENIZERS_PARALLELISM: 'false' }
       });
-      writer.on('error', reject);
-    });
+      const info = stdout.trim().split('\n').pop();
+      await runFFmpeg(['-y', '-i', wavPath, '-ar', '44100', '-ac', '2', '-b:a', '160k', outputPath]);
+      this.logger.info(`${engine} narration complete: ${info}`);
+    } finally {
+      await fs.unlink(textPath).catch(() => {});
+      await fs.unlink(wavPath).catch(() => {});
+    }
+    return outputPath;
   }
 
   async generateLocalMacTTS(text, outputPath) {
@@ -538,7 +573,12 @@ class AIVideoGenerator {
       }
 
       const videoPath = outputPath.replace('.mp4', '_visual.mp4');
-      const duration = this.calculateScriptDuration(script);
+      // The visual track must cover the whole narration; the word-count estimate is only a fallback.
+      let duration = this.calculateScriptDuration(script);
+      if (await this.isUsableAudioFile(audioPath)) {
+        const narrationSeconds = Number(await getMediaDuration(audioPath));
+        if (Number.isFinite(narrationSeconds) && narrationSeconds > 0) duration = Math.ceil(narrationSeconds + 1);
+      }
       await this.renderSlidesToVideo(stills, duration, videoPath);
 
       // Add audio
@@ -820,6 +860,9 @@ class AIVideoGenerator {
       script.mainContent.sections.forEach(section => {
         if (typeof section.content === 'string') {
           totalWords += section.content.split(' ').length;
+        }
+        if (Array.isArray(section.content)) {
+          totalWords += section.content.filter(line => typeof line === 'string').join(' ').split(/\s+/).filter(Boolean).length;
         }
         if (section.items) {
           section.items.forEach(item => {

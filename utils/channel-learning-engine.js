@@ -48,7 +48,8 @@ class ChannelLearningEngine {
     const watchTime = analytics.watchTime || {};
     const engagement = analytics.engagement || {};
     const outcomes = analytics.outcomes || {};
-    const impressions = this.number(views.totalImpressions || report.thumbnailMetrics?.impressions);
+    // Impressions and CTR are null when YouTube does not provide them (the Analytics API has neither).
+    const impressions = this.optionalNumber(views.totalImpressions ?? report.thumbnailMetrics?.impressions);
     const totalViews = this.number(views.totalViews);
     const watchMinutes = this.number(watchTime.totalWatchTime);
     const netSubscribers = outcomes.subscribersAvailable ? this.optionalNumber(outcomes.netSubscribers) : null;
@@ -63,7 +64,7 @@ class ChannelLearningEngine {
     return {
       views: totalViews,
       impressions,
-      ctr: this.number(report.thumbnailMetrics?.clickThroughRate ?? views.averageCTR),
+      ctr: this.optionalNumber(report.thumbnailMetrics?.clickThroughRate ?? views.averageCTR),
       retention: this.number(watchTime.averageViewPercentage),
       averageViewDuration: this.number(watchTime.averageViewDuration),
       watchMinutes,
@@ -92,7 +93,11 @@ class ChannelLearningEngine {
         : null,
       roi: estimatedRevenue !== null && productionCost !== null && productionCost > 0 && cost.complete === true && currencyCompatible
         ? Number((((estimatedRevenue - productionCost) / productionCost) * 100).toFixed(1))
-        : null
+        : null,
+      // Persuasion, in percent (react mode): the goal stance among the comments engaging with the subject, and the
+      // audience still there after the turn of a two-part video.
+      goalRate: this.optionalNumber(context.persuasion?.goalRate),
+      turnKept: this.optionalNumber(context.persuasion?.turnKept)
     };
   }
 
@@ -116,7 +121,9 @@ class ChannelLearningEngine {
         thumbnail.concept?.composition || thumbnail.concept?.style || thumbnail.style || 'unknown'
       ),
       provider: context.productionCost?.providers?.length === 1 ? this.slug(context.productionCost.providers[0]) : 'mixed_or_unknown',
-      source: strategy.planRationale ? 'autonomous_operator' : 'manual'
+      source: strategy.planRationale ? 'autonomous_operator' : 'manual',
+      origin: this.slug(strategy.origin || 'planned'),
+      technique: strategy.technique || 'none'
     };
   }
 
@@ -124,7 +131,7 @@ class ChannelLearningEngine {
     const keys = [
       'views', 'impressions', 'ctr', 'retention', 'averageViewDuration', 'watchMinutes', 'watchHours',
       'engagementRate', 'performanceScore', 'netSubscribers', 'subscribersPerThousandImpressions',
-      'estimatedRevenue', 'revenuePerThousandViews', 'productionCost', 'netRevenue', 'roi'
+      'estimatedRevenue', 'revenuePerThousandViews', 'productionCost', 'netRevenue', 'roi', 'goalRate', 'turnKept'
     ];
     return Object.fromEntries(keys.map(key => [key, this.median(
       snapshots.map(snapshot => this.optionalNumber(snapshot.metrics?.[key])).filter(value => value !== null)
@@ -142,6 +149,11 @@ class ChannelLearningEngine {
   }
 
   confidenceFor(metrics) {
+    // Without impressions, the views alone say how much evidence a measure carries.
+    if (metrics.impressions === null || metrics.impressions === undefined) {
+      if (metrics.views >= 300) return 'high';
+      return metrics.views >= 30 ? 'medium' : 'low';
+    }
     if (metrics.impressions >= 1000 && metrics.views >= 100) return 'high';
     if (metrics.impressions >= 100 && metrics.views >= 20) return 'medium';
     return 'low';
@@ -187,7 +199,11 @@ class ChannelLearningEngine {
       { key: 'format', metric: 'performanceScore', label: 'format', minimumDifference: 10 },
       { key: 'length', metric: 'retention', label: 'video length', minimumDifference: 8 },
       { key: 'hookLength', metric: 'retention', label: 'hook style', minimumDifference: 8 },
-      { key: 'titleLength', metric: 'ctr', label: 'title style', minimumDifference: 1.25 }
+      { key: 'titleLength', metric: 'ctr', label: 'title style', minimumDifference: 1.25 },
+      // React mode: what moves commenters to the profile's goal stance, rather than what gets watched.
+      { key: 'format', metric: 'goalRate', label: 'format', minimumDifference: 5, category: 'persuasion' },
+      { key: 'origin', metric: 'goalRate', label: 'subject origin', minimumDifference: 5, category: 'persuasion' },
+      { key: 'format', metric: 'turnKept', label: 'format', minimumDifference: 5, category: 'persuasion' }
     ];
     const recommendations = [];
 
@@ -197,6 +213,7 @@ class ChannelLearningEngine {
         const value = snapshot.contentAttributes?.[dimension.key];
         const metric = this.number(snapshot.metrics?.[dimension.metric]);
         if (!value || value === 'unknown' || !Number.isFinite(metric)) continue;
+        if (this.optionalNumber(snapshot.metrics?.[dimension.metric]) === null) continue;
         if (!groups.has(value)) groups.set(value, []);
         groups.get(value).push(metric);
       }
@@ -208,9 +225,11 @@ class ChannelLearningEngine {
 
       const best = ranked[0];
       const weakest = ranked.at(-1);
-      const metricLabel = dimension.metric === 'ctr' ? 'CTR' : dimension.metric === 'retention' ? 'retention' : 'performance score';
+      const metricLabel = {
+        ctr: 'CTR', retention: 'retention', goalRate: 'comments in the goal stance', turnKept: 'audience kept after the turn'
+      }[dimension.metric] || 'performance score';
       recommendations.push({
-        category: dimension.key,
+        category: dimension.category || dimension.key,
         title: `Favor ${this.readable(best.value)} over ${this.readable(weakest.value)} ${dimension.label}`,
         rationale: `${this.readable(best.value)} ${dimension.label} averaged ${this.metric(best.average, dimension.metric)} ${metricLabel} across ${best.count} videos versus ${this.metric(weakest.average, dimension.metric)} across ${weakest.count}.`,
         evidence: { dimension: dimension.key, metric: dimension.metric, best, weakest },
@@ -222,20 +241,24 @@ class ChannelLearningEngine {
   }
 
   buildChannelRecommendations(snapshots) {
-    const sufficientlyExposed = snapshots.filter(snapshot => this.number(snapshot.metrics?.impressions) >= 100);
+    // Enough exposure: 100 impressions, or 50 views when YouTube gives no impressions.
+    const sufficientlyExposed = snapshots.filter(snapshot => (this.optionalNumber(snapshot.metrics?.impressions) === null
+      ? this.number(snapshot.metrics?.views) >= 50
+      : this.number(snapshot.metrics?.impressions) >= 100));
     if (sufficientlyExposed.length < 2) return [];
-    const averageCTR = this.average(sufficientlyExposed.map(item => this.number(item.metrics.ctr)));
+    const withCTR = sufficientlyExposed.filter(item => this.optionalNumber(item.metrics.ctr) !== null);
+    const averageCTR = withCTR.length >= 2 ? this.average(withCTR.map(item => this.number(item.metrics.ctr))) : null;
     const averageRetention = this.average(sufficientlyExposed.map(item => this.number(item.metrics.retention)));
     const recommendations = [];
 
-    if (averageCTR < 4) {
+    if (averageCTR !== null && averageCTR < 4) {
       recommendations.push({
         category: 'packaging',
         title: 'Test new title and thumbnail packaging',
-        rationale: `Channel CTR averaged ${averageCTR.toFixed(1)}% across ${sufficientlyExposed.length} sufficiently exposed videos.`,
-        evidence: { metric: 'ctr', average: averageCTR, sampleSize: sufficientlyExposed.length, minimumImpressions: 100 },
+        rationale: `Channel CTR averaged ${averageCTR.toFixed(1)}% across ${withCTR.length} sufficiently exposed videos.`,
+        evidence: { metric: 'ctr', average: averageCTR, sampleSize: withCTR.length, minimumImpressions: 100 },
         proposedChange: { target: 'review', experiment: 'title_thumbnail_variant' },
-        confidence: sufficientlyExposed.length >= 5 ? 'high' : 'medium'
+        confidence: withCTR.length >= 5 ? 'high' : 'medium'
       });
     }
     if (averageRetention < 35) {
@@ -331,7 +354,8 @@ class ChannelLearningEngine {
       watch_hours: { id: 'watch_hours', metric: 'watchHours', label: 'Watch hours', unit: 'hours', aggregation: 'sum' },
       subscribers: { id: 'subscribers', metric: 'netSubscribers', label: 'Net subscribers', unit: 'count', aggregation: 'sum' },
       engagement: { id: 'engagement', metric: 'engagementRate', label: 'Engagement rate', unit: 'percent', aggregation: 'average' },
-      revenue: { id: 'revenue', metric: 'estimatedRevenue', label: 'Estimated revenue', unit: 'currency', aggregation: 'sum' }
+      revenue: { id: 'revenue', metric: 'estimatedRevenue', label: 'Estimated revenue', unit: 'currency', aggregation: 'sum' },
+      persuasion: { id: 'persuasion', metric: 'goalRate', label: 'Comments in the goal stance', unit: 'percent', aggregation: 'average' }
     };
     const definition = definitions[strategy.primary_kpi] || definitions.views;
     return {

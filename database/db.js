@@ -534,6 +534,25 @@ class Database {
         UNIQUE(production_id, position),
         FOREIGN KEY (production_id) REFERENCES productions(id)
       )`,
+      `CREATE TABLE IF NOT EXISTS social_posts (
+        id TEXT PRIMARY KEY,
+        short_clip_id TEXT NOT NULL,
+        production_id TEXT,
+        platform TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'scheduled',
+        publish_time TEXT,
+        metadata TEXT NOT NULL DEFAULT '{}',
+        external_id TEXT,
+        url TEXT,
+        error TEXT,
+        attempts INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+        updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(short_clip_id, platform),
+        FOREIGN KEY (short_clip_id) REFERENCES shorts_clips(id)
+      )`,
+      `CREATE INDEX IF NOT EXISTS idx_social_posts_due
+       ON social_posts(status, publish_time)`,
       `CREATE TABLE IF NOT EXISTS channel_profiles (
         id TEXT PRIMARY KEY,
         channel_name TEXT,
@@ -607,6 +626,80 @@ class Database {
         status TEXT DEFAULT 'unread',
         created_at TEXT DEFAULT CURRENT_TIMESTAMP
       )`,
+      // Claims widely defended on YouTube and rarely answered (topic gap finder): what the planner covers first
+      `CREATE TABLE IF NOT EXISTS topic_gaps (
+        id TEXT PRIMARY KEY,
+        claim TEXT NOT NULL,
+        query TEXT NOT NULL,
+        pillar TEXT,
+        demand_views INTEGER DEFAULT 0,
+        supply_views INTEGER DEFAULT 0,
+        defend_count INTEGER DEFAULT 0,
+        answer_count INTEGER DEFAULT 0,
+        top_videos TEXT NOT NULL DEFAULT '[]',
+        score REAL DEFAULT 0,
+        status TEXT DEFAULT 'open',
+        production_id TEXT,
+        measured_at TEXT DEFAULT CURRENT_TIMESTAMP,
+        updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+      )`,
+      // Channels that defend such claims with a large audience: the reactive watcher reads their public feeds
+      `CREATE TABLE IF NOT EXISTS watched_channels (
+        channel_id TEXT PRIMARY KEY,
+        title TEXT,
+        defend_views INTEGER DEFAULT 0,
+        origin TEXT DEFAULT 'gap',
+        active INTEGER DEFAULT 1,
+        last_checked_at TEXT,
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+        updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+      )`,
+      // Viral videos defending a claim, answered fast (utils/reactive-watch.js): the source video stays here, never in
+      // a script or its sources
+      `CREATE TABLE IF NOT EXISTS reactive_items (
+        id TEXT PRIMARY KEY,
+        video_id TEXT UNIQUE NOT NULL,
+        channel_id TEXT,
+        video TEXT NOT NULL DEFAULT '{}',
+        claim TEXT NOT NULL,
+        topic TEXT NOT NULL,
+        status TEXT DEFAULT 'queued',
+        job_id TEXT,
+        production_id TEXT,
+        error TEXT,
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+        updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+      )`,
+      // Errors found after publication: shown on the public verification site, never pushed to the published video
+      `CREATE TABLE IF NOT EXISTS corrections (
+        id TEXT PRIMARY KEY,
+        production_id TEXT NOT NULL,
+        text TEXT NOT NULL,
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (production_id) REFERENCES productions(id)
+      )`,
+      // Scripts on highly specialised subjects waiting for (or decided by) a human expert, one row per revision
+      `CREATE TABLE IF NOT EXISTS expert_reviews (
+        id TEXT PRIMARY KEY,
+        job_id TEXT,
+        revision INTEGER DEFAULT 1,
+        status TEXT DEFAULT 'pending',
+        topic TEXT,
+        title TEXT,
+        domain TEXT,
+        assessment TEXT NOT NULL DEFAULT '{}',
+        script TEXT NOT NULL DEFAULT '{}',
+        script_hash TEXT,
+        script_path TEXT,
+        decision_notes TEXT,
+        decided_by TEXT,
+        decided_at TEXT,
+        notified_at TEXT,
+        notify_error TEXT,
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+        updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (job_id) REFERENCES generation_jobs(id)
+      )`,
       `CREATE TABLE IF NOT EXISTS readiness_runs (
         id TEXT PRIMARY KEY,
         status TEXT NOT NULL,
@@ -647,13 +740,76 @@ class Database {
     await this.ensureColumns('discoverability_audits', {
       error_code: 'TEXT'
     });
+    // Montage Shorts: the cuts (source timeline), the closing subscribe line, the critic's verdict and the measured
+    // performance used to calibrate the next ones.
+    await this.ensureColumns('shorts_clips', {
+      segments: "TEXT NOT NULL DEFAULT '[]'",
+      cta: 'TEXT',
+      critic: "TEXT NOT NULL DEFAULT '{}'",
+      performance: "TEXT NOT NULL DEFAULT '{}'"
+    });
+    // Persuasion: what each comment says about the claim (Jev), and its summary per video.
+    await this.ensureColumns('audience_comments', {
+      stance: 'TEXT',
+      stance_confidence: 'REAL',
+      stance_at: 'TEXT'
+    });
+    await this.ensureColumns('engagement_insights', {
+      persuasion: "TEXT NOT NULL DEFAULT '{}'"
+    });
+    // Watch list (utils/watch-list.js): how often a channel was found defending claims, why it is watched (internal,
+    // never published), and its score from the audience's reaction to the channel's answers to it.
+    await this.ensureColumns('watched_channels', {
+      sightings: 'INTEGER DEFAULT 1',
+      category: 'TEXT',
+      reason: 'TEXT',
+      score: 'REAL',
+      responses: 'INTEGER DEFAULT 0',
+      activated_at: 'TEXT',
+      deactivated_reason: 'TEXT',
+      // Public subscriber count (the only watch-list figure the public site shows, next to the answers published).
+      subscribers: 'INTEGER'
+    });
+    // React mode: the passages quoted from the examined video, its technique and how urgent the answer is.
+    await this.ensureColumns('reactive_items', {
+      passages: "TEXT NOT NULL DEFAULT '[]'",
+      technique: 'TEXT',
+      priority: 'REAL DEFAULT 0',
+      // An answer is a series of Shorts (parts, 1 for a single Short); episodes: [{ part, jobId, productionId }] in
+      // order; compilation_id: the production joining the published parts into one 16:9 video.
+      parts: 'INTEGER DEFAULT 1',
+      episodes: "TEXT NOT NULL DEFAULT '[]'",
+      compilation_id: 'TEXT'
+    });
 
     // Insert default settings
     await this.insertDefaultSettings();
+
+    await this.runMigrations();
+  }
+
+  // Data migrations of this installation (database/migrations/*.js, each exporting async (db) => {}): each one runs once,
+  // in file name order, and is recorded in the migrations table.
+  async runMigrations(directory = path.join(__dirname, 'migrations')) {
+    await this.executeQuery('CREATE TABLE IF NOT EXISTS migrations (name TEXT PRIMARY KEY, applied_at TEXT DEFAULT CURRENT_TIMESTAMP)');
+    let files = [];
+    try {
+      files = (await fs.readdir(directory)).filter(name => name.endsWith('.js')).sort();
+    } catch (_error) {
+      return [];
+    }
+    const applied = new Set((await this.getAllRows('SELECT name FROM migrations')).map(row => row.name));
+    const ran = [];
+    for (const name of files.filter(file => !applied.has(file))) {
+      await require(path.join(directory, name))(this);
+      await this.executeQuery('INSERT INTO migrations (name) VALUES (?)', [name]);
+      ran.push(name);
+    }
+    return ran;
   }
 
   async ensureColumns(tableName, columns) {
-    const allowedTables = new Set(['production_scenes', 'channel_strategies', 'discoverability_audits']);
+    const allowedTables = new Set(['production_scenes', 'channel_strategies', 'discoverability_audits', 'shorts_clips', 'audience_comments', 'engagement_insights', 'watched_channels', 'reactive_items']);
     if (!allowedTables.has(tableName)) throw new Error(`Unsupported migration table: ${tableName}`);
     const existing = new Set((await this.getAllRows(`PRAGMA table_info(${tableName})`)).map(column => column.name));
     for (const [columnName, definition] of Object.entries(columns)) {
@@ -1004,6 +1160,11 @@ class Database {
     return this.getGenerationJob(id);
   }
 
+  async listGenerationJobsByStatus(status) {
+    const rows = await this.getAllRows('SELECT * FROM generation_jobs WHERE status = ? ORDER BY created_at', [status]);
+    return rows.map(row => ({ ...row, details: JSON.parse(row.details || '{}'), cancelRequested: Boolean(row.cancel_requested) }));
+  }
+
   async listGenerationJobs(limit = 30) {
     const rows = await this.getAllRows('SELECT * FROM generation_jobs ORDER BY created_at DESC LIMIT ?', [limit]);
     return Promise.all(rows.map(async row => {
@@ -1286,26 +1447,39 @@ class Database {
 
   async replaceShortClips(productionId, clips = []) {
     await this.executeQuery('DELETE FROM shorts_clips WHERE production_id = ?', [productionId]);
-    for (const [position, clip] of clips.entries()) {
-      const id = clip.id || this.generateId('short');
-      await this.executeQuery(
-        `INSERT INTO shorts_clips (
-          id, production_id, position, title, description, tags, source_scene_ids,
-          start_seconds, duration, layout, rationale, status, output_path, captions_path,
-          publish_time, privacy_status, inherited_evidence, rendered_at, approved_at,
-          schedule_id, youtube_id, youtube_url, error
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        [
-          id, productionId, position, clip.title, clip.description || '', JSON.stringify(clip.tags || []),
-          JSON.stringify(clip.sourceSceneIds || []), Number(clip.startSeconds || 0), Number(clip.duration || 30),
-          clip.layout || 'blur', clip.rationale || null, clip.status || 'proposed', clip.outputPath || null,
-          clip.captionsPath || null, clip.publishTime || null, clip.privacyStatus || 'private',
-          JSON.stringify(clip.inheritedEvidence || {}), clip.renderedAt || null, clip.approvedAt || null,
-          clip.scheduleId || null, clip.youtubeId || null, clip.youtubeUrl || null, clip.error || null
-        ]
-      );
-    }
+    for (const [position, clip] of clips.entries()) await this.insertShortClip(productionId, position, clip);
     return this.listShortClips(productionId);
+  }
+
+  // Adds Shorts after the existing ones of a production (whose positions are kept).
+  async appendShortClips(productionId, clips = []) {
+    const row = await this.getRow('SELECT MAX(position) AS last FROM shorts_clips WHERE production_id = ?', [productionId]);
+    const first = row?.last === null || row?.last === undefined ? 0 : Number(row.last) + 1;
+    for (const [index, clip] of clips.entries()) await this.insertShortClip(productionId, first + index, clip);
+    return this.listShortClips(productionId);
+  }
+
+  async insertShortClip(productionId, position, clip) {
+    const id = clip.id || this.generateId('short');
+    await this.executeQuery(
+      `INSERT INTO shorts_clips (
+        id, production_id, position, title, description, tags, source_scene_ids,
+        start_seconds, duration, layout, rationale, status, output_path, captions_path,
+        publish_time, privacy_status, inherited_evidence, rendered_at, approved_at,
+        schedule_id, youtube_id, youtube_url, error, segments, cta, critic, performance
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        id, productionId, position, clip.title, clip.description || '', JSON.stringify(clip.tags || []),
+        JSON.stringify(clip.sourceSceneIds || []), Number(clip.startSeconds || 0), Number(clip.duration || 30),
+        clip.layout || 'blur', clip.rationale || null, clip.status || 'proposed', clip.outputPath || null,
+        clip.captionsPath || null, clip.publishTime || null, clip.privacyStatus || 'private',
+        JSON.stringify(clip.inheritedEvidence || {}), clip.renderedAt || null, clip.approvedAt || null,
+        clip.scheduleId || null, clip.youtubeId || null, clip.youtubeUrl || null, clip.error || null,
+        JSON.stringify(clip.segments || []), clip.cta ? JSON.stringify(clip.cta) : null,
+        JSON.stringify(clip.critic || {}), JSON.stringify(clip.performance || {})
+      ]
+    );
+    return id;
   }
 
   async listShortClips(productionId) {
@@ -1320,6 +1494,27 @@ class Database {
     return this.parseShortClip(await this.getRow('SELECT * FROM shorts_clips WHERE id = ?', [id]));
   }
 
+  // Published Shorts whose YouTube performance was measured, most recent first.
+  async listMeasuredShortClips(limit = 60) {
+    const rows = await this.getAllRows(
+      `SELECT * FROM shorts_clips WHERE status = 'published' AND performance IS NOT NULL AND performance != '{}'
+       ORDER BY updated_at DESC LIMIT ?`,
+      [limit]
+    );
+    return rows.map(row => this.parseShortClip(row));
+  }
+
+  // Published Shorts old enough to be measured and not measured since `measuredBefore`.
+  async listShortClipsToMeasure(publishedBefore, measuredBefore) {
+    const rows = await this.getAllRows(
+      `SELECT * FROM shorts_clips WHERE status = 'published' AND youtube_id IS NOT NULL AND publish_time <= ?
+       ORDER BY publish_time DESC LIMIT 50`,
+      [publishedBefore]
+    );
+    return rows.map(row => this.parseShortClip(row))
+      .filter(clip => !clip.performance?.measuredAt || clip.performance.measuredAt < measuredBefore);
+  }
+
   async updateShortClip(id, changes = {}) {
     const current = await this.getShortClip(id);
     if (!current) return null;
@@ -1329,7 +1524,8 @@ class Database {
         title = ?, description = ?, tags = ?, source_scene_ids = ?, start_seconds = ?,
         duration = ?, layout = ?, rationale = ?, status = ?, output_path = ?, captions_path = ?,
         publish_time = ?, privacy_status = ?, inherited_evidence = ?, rendered_at = ?, approved_at = ?,
-        schedule_id = ?, youtube_id = ?, youtube_url = ?, error = ?, updated_at = datetime('now')
+        schedule_id = ?, youtube_id = ?, youtube_url = ?, error = ?, segments = ?, cta = ?, critic = ?,
+        performance = ?, updated_at = datetime('now')
        WHERE id = ?`,
       [
         next.title, next.description || '', JSON.stringify(next.tags || []), JSON.stringify(next.sourceSceneIds || []),
@@ -1337,7 +1533,8 @@ class Database {
         next.status || 'proposed', next.outputPath || null, next.captionsPath || null, next.publishTime || null,
         next.privacyStatus || 'private', JSON.stringify(next.inheritedEvidence || {}), next.renderedAt || null,
         next.approvedAt || null, next.scheduleId || null, next.youtubeId || null, next.youtubeUrl || null,
-        next.error || null, id
+        next.error || null, JSON.stringify(next.segments || []), next.cta ? JSON.stringify(next.cta) : null,
+        JSON.stringify(next.critic || {}), JSON.stringify(next.performance || {}), id
       ]
     );
     return this.getShortClip(id);
@@ -1362,7 +1559,83 @@ class Database {
       approvedAt: row.approved_at || null,
       scheduleId: row.schedule_id || null,
       youtubeId: row.youtube_id || null,
-      youtubeUrl: row.youtube_url || null
+      youtubeUrl: row.youtube_url || null,
+      segments: JSON.parse(row.segments || '[]'),
+      cta: row.cta ? JSON.parse(row.cta) : null,
+      critic: JSON.parse(row.critic || '{}'),
+      performance: JSON.parse(row.performance || '{}')
+    };
+  }
+
+  // TikTok / Instagram copies of a Short: one row per platform, created at approval (an existing row is kept).
+  async saveSocialPost(post = {}) {
+    await this.executeQuery(
+      `INSERT OR IGNORE INTO social_posts (id, short_clip_id, production_id, platform, status, publish_time, metadata)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      [
+        post.id || this.generateId('social'), post.shortClipId, post.productionId || null, post.platform,
+        post.status || 'scheduled', post.publishTime || null, JSON.stringify(post.metadata || {})
+      ]
+    );
+    return this.parseSocialPost(await this.getRow(
+      'SELECT * FROM social_posts WHERE short_clip_id = ? AND platform = ?',
+      [post.shortClipId, post.platform]
+    ));
+  }
+
+  async getSocialPost(id) {
+    return this.parseSocialPost(await this.getRow('SELECT * FROM social_posts WHERE id = ?', [id]));
+  }
+
+  async updateSocialPost(id, changes = {}) {
+    const current = await this.getSocialPost(id);
+    if (!current) return null;
+    const next = { ...current, ...changes };
+    await this.executeQuery(
+      `UPDATE social_posts SET status = ?, publish_time = ?, metadata = ?, external_id = ?, url = ?, error = ?,
+        attempts = ?, updated_at = datetime('now') WHERE id = ?`,
+      [
+        next.status, next.publishTime || null, JSON.stringify(next.metadata || {}), next.externalId || null,
+        next.url || null, next.error || null, Number(next.attempts || 0), id
+      ]
+    );
+    return this.getSocialPost(id);
+  }
+
+  async getDueSocialPosts(nowIso = new Date().toISOString()) {
+    const rows = await this.getAllRows(
+      `SELECT * FROM social_posts WHERE status = 'scheduled' AND publish_time <= ? ORDER BY publish_time`,
+      [nowIso]
+    );
+    return rows.map(row => this.parseSocialPost(row));
+  }
+
+  async getProcessingSocialPosts() {
+    const rows = await this.getAllRows(`SELECT * FROM social_posts WHERE status = 'processing' ORDER BY publish_time`);
+    return rows.map(row => this.parseSocialPost(row));
+  }
+
+  async listSocialPostsForClip(shortClipId) {
+    const rows = await this.getAllRows('SELECT * FROM social_posts WHERE short_clip_id = ? ORDER BY platform', [shortClipId]);
+    return rows.map(row => this.parseSocialPost(row));
+  }
+
+  parseSocialPost(row) {
+    if (!row) return null;
+    return {
+      id: row.id,
+      shortClipId: row.short_clip_id,
+      productionId: row.production_id || null,
+      platform: row.platform,
+      status: row.status,
+      publishTime: row.publish_time || null,
+      metadata: JSON.parse(row.metadata || '{}'),
+      externalId: row.external_id || null,
+      url: row.url || null,
+      error: row.error || null,
+      attempts: Number(row.attempts || 0),
+      createdAt: row.created_at,
+      updatedAt: row.updated_at
     };
   }
 
@@ -1376,6 +1649,12 @@ class Database {
       `UPDATE operator_runs SET status = 'interrupted', stage = 'interrupted',
        error = 'The application restarted before this operator run finished', updated_at = datetime('now'),
        completed_at = datetime('now') WHERE status IN ('queued', 'running', 'cancelling')`
+    );
+    // The upload may have reached TikTok or Instagram before the restart: never send it a second time blindly.
+    await this.executeQuery(
+      `UPDATE social_posts SET status = 'reconciliation_required',
+       error = 'The application restarted during the upload', updated_at = datetime('now')
+       WHERE status = 'uploading'`
     );
   }
 
@@ -1749,6 +2028,227 @@ class Database {
     return id;
   }
 
+  async saveTopicGap(gap) {
+    const id = gap.id || this.generateId('gap');
+    await this.executeQuery(
+      `INSERT INTO topic_gaps (id, claim, query, pillar, demand_views, supply_views, defend_count, answer_count, top_videos, score, status, measured_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))
+       ON CONFLICT(id) DO UPDATE SET demand_views = excluded.demand_views, supply_views = excluded.supply_views,
+         defend_count = excluded.defend_count, answer_count = excluded.answer_count, top_videos = excluded.top_videos,
+         score = excluded.score, measured_at = excluded.measured_at, updated_at = excluded.updated_at`,
+      [id, gap.claim, gap.query, gap.pillar || null, gap.demandViews || 0, gap.supplyViews || 0, gap.defendCount || 0,
+        gap.answerCount || 0, JSON.stringify(gap.topVideos || []), gap.score || 0, gap.status || 'open']
+    );
+    return this.getTopicGap(id);
+  }
+
+  async getTopicGap(id) {
+    const row = await this.getRow('SELECT * FROM topic_gaps WHERE id = ?', [id]);
+    return row ? this.parseTopicGap(row) : null;
+  }
+
+  // Best score first.
+  async listTopicGaps({ status = null, limit = 50 } = {}) {
+    const rows = await this.getAllRows(
+      'SELECT * FROM topic_gaps WHERE (? IS NULL OR status = ?) ORDER BY score DESC, measured_at DESC LIMIT ?',
+      [status, status, limit]
+    );
+    return rows.map(row => this.parseTopicGap(row));
+  }
+
+  async updateTopicGap(id, { status, productionId } = {}) {
+    await this.executeQuery(
+      `UPDATE topic_gaps SET status = COALESCE(?, status), production_id = COALESCE(?, production_id), updated_at = datetime('now') WHERE id = ?`,
+      [status || null, productionId || null, id]
+    );
+    return this.getTopicGap(id);
+  }
+
+  parseTopicGap(row) {
+    return {
+      id: row.id,
+      claim: row.claim,
+      query: row.query,
+      pillar: row.pillar,
+      demandViews: Number(row.demand_views || 0),
+      supplyViews: Number(row.supply_views || 0),
+      defendCount: Number(row.defend_count || 0),
+      answerCount: Number(row.answer_count || 0),
+      topVideos: JSON.parse(row.top_videos || '[]'),
+      score: Number(row.score || 0),
+      status: row.status,
+      productionId: row.production_id,
+      measuredAt: row.measured_at
+    };
+  }
+
+  // Records that a channel was found defending a claim (or named by discovery, or added by hand); being watched is
+  // decided by the watch list (utils/watch-list.js), which keeps at most WATCH_MAX_CHANNELS. A channel added by hand
+  // stays manual.
+  async upsertWatchedChannel({ channelId, title = null, defendViews = 0, origin = 'gap', category = null, reason = null, subscribers = null }) {
+    await this.executeQuery(
+      `INSERT INTO watched_channels (channel_id, title, defend_views, origin, category, reason, subscribers, active, sightings) VALUES (?, ?, ?, ?, ?, ?, ?, 0, 1)
+       ON CONFLICT(channel_id) DO UPDATE SET title = COALESCE(excluded.title, title),
+         defend_views = MAX(defend_views, excluded.defend_views), sightings = sightings + 1,
+         category = COALESCE(excluded.category, category), reason = COALESCE(excluded.reason, reason),
+         subscribers = COALESCE(excluded.subscribers, subscribers),
+         origin = CASE WHEN excluded.origin = 'manual' OR origin = 'manual' THEN 'manual' ELSE origin END, updated_at = datetime('now')`,
+      [channelId, title, defendViews, origin, category, reason, subscribers]
+    );
+    return this.getWatchedChannel(channelId);
+  }
+
+  async getWatchedChannel(channelId) {
+    const row = await this.getRow('SELECT * FROM watched_channels WHERE channel_id = ?', [channelId]);
+    return row ? this.parseWatchedChannel(row) : null;
+  }
+
+  async listWatchedChannels({ active = true } = {}) {
+    const rows = await this.getAllRows(
+      'SELECT * FROM watched_channels WHERE (? IS NULL OR active = ?) ORDER BY active DESC, score DESC, defend_views DESC',
+      [active === null ? null : Number(active), active === null ? null : Number(active)]
+    );
+    return rows.map(row => this.parseWatchedChannel(row));
+  }
+
+  parseWatchedChannel(row) {
+    return {
+      channelId: row.channel_id,
+      title: row.title,
+      defendViews: Number(row.defend_views || 0),
+      origin: row.origin,
+      category: row.category || null,
+      reason: row.reason || null,
+      active: Boolean(row.active),
+      sightings: Number(row.sightings || 1),
+      score: row.score === null || row.score === undefined ? null : Number(row.score),
+      responses: Number(row.responses || 0),
+      subscribers: row.subscribers === null || row.subscribers === undefined ? null : Number(row.subscribers),
+      activatedAt: row.activated_at || null,
+      deactivatedReason: row.deactivated_reason || null,
+      lastCheckedAt: row.last_checked_at
+    };
+  }
+
+  async setWatchedChannelActive(channelId, active, reason = null) {
+    await this.executeQuery(
+      `UPDATE watched_channels SET active = ?, activated_at = CASE WHEN ? = 1 THEN datetime('now') ELSE activated_at END,
+       deactivated_reason = ?, updated_at = datetime('now') WHERE channel_id = ?`,
+      [active ? 1 : 0, active ? 1 : 0, active ? null : reason, channelId]
+    );
+  }
+
+  async setWatchedChannelScore(channelId, score, responses) {
+    await this.executeQuery(
+      "UPDATE watched_channels SET score = ?, responses = ?, updated_at = datetime('now') WHERE channel_id = ?",
+      [score, responses, channelId]
+    );
+  }
+
+  async markWatchedChannelChecked(channelId) {
+    await this.executeQuery("UPDATE watched_channels SET last_checked_at = datetime('now') WHERE channel_id = ?", [channelId]);
+  }
+
+  async createReactiveItem({ videoId, channelId = null, video = {}, claim, topic, passages = [], technique = null, priority = 0, parts = 1 }) {
+    const id = this.generateId('reactive');
+    await this.executeQuery(
+      'INSERT INTO reactive_items (id, video_id, channel_id, video, claim, topic, passages, technique, priority, parts) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+      [id, videoId, channelId, JSON.stringify(video), claim, topic, JSON.stringify(passages), technique, priority, Math.max(1, Math.round(Number(parts) || 1))]
+    );
+    return this.getReactiveItem(id);
+  }
+
+  // Answers to one channel since a date (not counting videos set aside), for the per-channel weekly cap.
+  async countReactiveItemsForChannelSince(channelId, since) {
+    const row = await this.getRow(
+      "SELECT COUNT(*) AS count FROM reactive_items WHERE channel_id = ? AND created_at >= ? AND status != 'dismissed'",
+      [channelId, since]
+    );
+    return Number(row?.count || 0);
+  }
+
+  async getReactiveItem(id) {
+    const row = await this.getRow('SELECT * FROM reactive_items WHERE id = ?', [id]);
+    return row ? this.parseReactiveItem(row) : null;
+  }
+
+  // By the examined video, or by the production of any of its parts.
+  async findReactiveItem({ videoId = null, productionId = null } = {}) {
+    const row = await this.getRow(
+      `SELECT * FROM reactive_items WHERE (? IS NOT NULL AND video_id = ?) OR (? IS NOT NULL AND production_id = ?)
+       OR (? IS NOT NULL AND instr(episodes, ?) > 0) LIMIT 1`,
+      [videoId, videoId, productionId, productionId, productionId, productionId ? JSON.stringify(productionId) : null]
+    );
+    return row ? this.parseReactiveItem(row) : null;
+  }
+
+  // The most urgent first (Jev's stakes), then the oldest.
+  async listReactiveItems({ status = null, limit = 50 } = {}) {
+    const statuses = Array.isArray(status) ? status : status ? [status] : null;
+    const rows = await this.getAllRows(
+      `SELECT * FROM reactive_items ${statuses ? `WHERE status IN (${statuses.map(() => '?').join(', ')})` : ''} ORDER BY priority DESC, created_at ASC, id ASC LIMIT ?`,
+      [...(statuses || []), limit]
+    );
+    return rows.map(row => this.parseReactiveItem(row));
+  }
+
+  async countReactiveItemsSince(since) {
+    const row = await this.getRow("SELECT COUNT(*) AS count FROM reactive_items WHERE created_at >= ? AND status != 'dismissed'", [since]);
+    return Number(row?.count || 0);
+  }
+
+  async updateReactiveItem(id, changes = {}) {
+    const current = await this.getReactiveItem(id);
+    if (!current) return null;
+    const pick = (key, value) => (changes[key] === undefined ? value : changes[key]);
+    await this.executeQuery(
+      `UPDATE reactive_items SET status = ?, job_id = ?, production_id = ?, error = ?, passages = ?, technique = ?, priority = ?,
+       parts = ?, episodes = ?, compilation_id = ?, updated_at = datetime('now') WHERE id = ?`,
+      [pick('status', current.status), pick('jobId', current.jobId), pick('productionId', current.productionId), pick('error', current.error),
+        JSON.stringify(pick('passages', current.passages)), pick('technique', current.technique), pick('priority', current.priority),
+        pick('parts', current.parts), JSON.stringify(pick('episodes', current.episodes)), pick('compilationId', current.compilationId), id]
+    );
+    return this.getReactiveItem(id);
+  }
+
+  parseReactiveItem(row) {
+    return {
+      id: row.id,
+      videoId: row.video_id,
+      channelId: row.channel_id,
+      video: JSON.parse(row.video || '{}'),
+      claim: row.claim,
+      topic: row.topic,
+      status: row.status,
+      jobId: row.job_id,
+      productionId: row.production_id,
+      error: row.error,
+      passages: JSON.parse(row.passages || '[]'),
+      technique: row.technique || null,
+      priority: Number(row.priority || 0),
+      parts: Math.max(1, Number(row.parts) || 1),
+      episodes: JSON.parse(row.episodes || '[]'),
+      compilationId: row.compilation_id || null,
+      createdAt: row.created_at,
+      updatedAt: row.updated_at
+    };
+  }
+
+  async addCorrection({ productionId, text }) {
+    const id = this.generateId('correction');
+    await this.executeQuery('INSERT INTO corrections (id, production_id, text) VALUES (?, ?, ?)', [id, productionId, text]);
+    return this.getRow('SELECT id, production_id AS productionId, text, created_at AS createdAt FROM corrections WHERE id = ?', [id]);
+  }
+
+  // Newest first; all of them, or one production's.
+  async listCorrections({ productionId = null, limit = 500 } = {}) {
+    return this.getAllRows(
+      `SELECT id, production_id AS productionId, text, created_at AS createdAt FROM corrections
+       WHERE (? IS NULL OR production_id = ?) ORDER BY created_at DESC, id DESC LIMIT ?`,
+      [productionId, productionId, limit]
+    );
+  }
+
   async listNotifications(limit = 20) {
     const rows = await this.getAllRows('SELECT * FROM notifications ORDER BY created_at DESC LIMIT ?', [limit]);
     return rows.map(row => ({ ...row, data: JSON.parse(row.data || '{}') }));
@@ -1756,6 +2256,80 @@ class Database {
 
   async markNotificationRead(id) {
     await this.executeQuery("UPDATE notifications SET status = 'read' WHERE id = ?", [id]);
+  }
+
+  async createExpertReview(review) {
+    const id = this.generateId('expert');
+    await this.executeQuery(
+      `INSERT INTO expert_reviews (id, job_id, revision, status, topic, title, domain, assessment, script, script_hash)
+       VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?)`,
+      [
+        id, review.jobId || null, review.revision || 1, review.topic || null, review.title || null, review.domain || null,
+        JSON.stringify(review.assessment || {}), JSON.stringify(review.script || {}), review.scriptHash || null
+      ]
+    );
+    return this.getExpertReview(id);
+  }
+
+  async getExpertReview(id) {
+    const row = await this.getRow('SELECT * FROM expert_reviews WHERE id = ?', [id]);
+    return row ? this.deserializeExpertReview(row) : null;
+  }
+
+  // Newest first; the first row of a job is its current review.
+  async listExpertReviews({ jobId = null, status = null, limit = 50 } = {}) {
+    const rows = await this.getAllRows(
+      `SELECT * FROM expert_reviews WHERE (? IS NULL OR job_id = ?) AND (? IS NULL OR status = ?)
+       ORDER BY created_at DESC, revision DESC LIMIT ?`,
+      [jobId, jobId, status, status, limit]
+    );
+    return rows.map(row => this.deserializeExpertReview(row));
+  }
+
+  async updateExpertReview(id, changes = {}) {
+    const current = await this.getExpertReview(id);
+    if (!current) return null;
+    const pick = (key, value) => changes[key] === undefined ? value : changes[key];
+    await this.executeQuery(
+      `UPDATE expert_reviews SET status = ?, domain = ?, assessment = ?, script_path = ?, decision_notes = ?, decided_by = ?,
+       decided_at = ?, notified_at = ?, notify_error = ?, updated_at = datetime('now') WHERE id = ?`,
+      [
+        pick('status', current.status),
+        pick('domain', current.domain),
+        JSON.stringify(pick('assessment', current.assessment) || {}),
+        pick('scriptPath', current.scriptPath),
+        pick('decisionNotes', current.decisionNotes),
+        pick('decidedBy', current.decidedBy),
+        pick('decidedAt', current.decidedAt),
+        pick('notifiedAt', current.notifiedAt),
+        pick('notifyError', current.notifyError),
+        id
+      ]
+    );
+    return this.getExpertReview(id);
+  }
+
+  deserializeExpertReview(row) {
+    return {
+      id: row.id,
+      jobId: row.job_id,
+      revision: Number(row.revision || 1),
+      status: row.status,
+      topic: row.topic,
+      title: row.title,
+      domain: row.domain,
+      assessment: JSON.parse(row.assessment || '{}'),
+      script: JSON.parse(row.script || '{}'),
+      scriptHash: row.script_hash,
+      scriptPath: row.script_path,
+      decisionNotes: row.decision_notes,
+      decidedBy: row.decided_by,
+      decidedAt: row.decided_at,
+      notifiedAt: row.notified_at,
+      notifyError: row.notify_error,
+      createdAt: row.created_at,
+      updatedAt: row.updated_at
+    };
   }
 
   async getRecentAutomationEvents(limit = 30) {
@@ -2432,8 +3006,35 @@ class Database {
       updatedAtYouTube: row.updated_at_youtube,
       flags: JSON.parse(row.flags || '[]'),
       analysisState: row.analysis_state,
-      repliedByAgent: Boolean(row.replied_by_agent)
+      repliedByAgent: Boolean(row.replied_by_agent),
+      stance: row.stance || null,
+      stanceConfidence: row.stance_confidence === null || row.stance_confidence === undefined ? null : Number(row.stance_confidence)
     };
+  }
+
+  // Comments of a video no stance was given to yet (the channel's own excluded), oldest first.
+  async listCommentsWithoutStance(videoId, limit = 500) {
+    const rows = await this.getAllRows(
+      `SELECT * FROM audience_comments WHERE video_id = ? AND stance IS NULL AND is_channel_owner = 0
+       ORDER BY published_at ASC LIMIT ?`,
+      [videoId, limit]
+    );
+    return rows.map(row => this.parseAudienceComment(row));
+  }
+
+  async setCommentStance(commentId, stance, confidence = null) {
+    await this.executeQuery(
+      'UPDATE audience_comments SET stance = ?, stance_confidence = ?, stance_at = CURRENT_TIMESTAMP WHERE comment_id = ?',
+      [stance, confidence, commentId]
+    );
+  }
+
+  async listClassifiedComments(videoId) {
+    const rows = await this.getAllRows(
+      'SELECT * FROM audience_comments WHERE video_id = ? AND stance IS NOT NULL AND is_channel_owner = 0',
+      [videoId]
+    );
+    return rows.map(row => this.parseAudienceComment(row));
   }
 
   async saveEngagementInsight(insight) {
@@ -2444,8 +3045,8 @@ class Database {
       `INSERT INTO engagement_insights (
         id, video_id, production_id, title, comment_count, analyzed_count,
         sentiment, themes, attention_flags, analysis_method, analyzed_at,
-        last_synced_at, newest_comment_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        last_synced_at, newest_comment_at, persuasion
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(video_id) DO UPDATE SET
         production_id = excluded.production_id,
         title = excluded.title,
@@ -2458,6 +3059,7 @@ class Database {
         analyzed_at = excluded.analyzed_at,
         last_synced_at = excluded.last_synced_at,
         newest_comment_at = excluded.newest_comment_at,
+        persuasion = excluded.persuasion,
         updated_at = CURRENT_TIMESTAMP`,
       [
         id,
@@ -2472,7 +3074,8 @@ class Database {
         merged.analysisMethod || 'ai',
         merged.analyzedAt || null,
         merged.lastSyncedAt || null,
-        merged.newestCommentAt || null
+        merged.newestCommentAt || null,
+        JSON.stringify(merged.persuasion || {})
       ]
     );
     return this.getEngagementInsight(insight.videoId);
@@ -2506,7 +3109,8 @@ class Database {
       analysisMethod: row.analysis_method,
       analyzedAt: row.analyzed_at,
       lastSyncedAt: row.last_synced_at,
-      newestCommentAt: row.newest_comment_at
+      newestCommentAt: row.newest_comment_at,
+      persuasion: JSON.parse(row.persuasion || '{}')
     };
   }
 
@@ -2644,7 +3248,8 @@ class Database {
       seo: JSON.parse(row.seo || '{}'),
       productionCost: this.summarizeProductionCost(sourceScenes),
       retentionScenes: this.buildRetentionSceneContext(sourceScenes, shortClip),
-      retentionDuration: isShort ? shortClip?.duration || null : sourceScenes.reduce((sum, scene) => sum + Number(scene.duration || 0), 0)
+      // A Short cut out of a video lasts as long as its clip; a Short that stands alone, as its own scenes.
+      retentionDuration: metadata.shortClipId ? shortClip?.duration || null : sourceScenes.reduce((sum, scene) => sum + Number(scene.duration || 0), 0)
     };
   }
 
@@ -2891,12 +3496,17 @@ class Database {
       scriptsCount,
       productionsCount,
       publishedCount,
+      publishedLast24hCount,
       analyticsCount
     ] = await Promise.all([
       this.getRow('SELECT COUNT(*) as count FROM content_strategies'),
       this.getRow('SELECT COUNT(*) as count FROM scripts'),
       this.getRow('SELECT COUNT(*) as count FROM productions'),
       this.getRow('SELECT COUNT(*) as count FROM publish_schedule WHERE status = "published"'),
+      this.getRow(
+        `SELECT COUNT(*) as count FROM publish_schedule WHERE status = 'published'
+         AND datetime(COALESCE(published_at, publish_time)) >= datetime('now', '-24 hours')`
+      ),
       this.getRow('SELECT COUNT(*) as count FROM analytics_reports')
     ]);
 
@@ -2905,6 +3515,7 @@ class Database {
       scripts: scriptsCount.count,
       productions: productionsCount.count,
       published: publishedCount.count,
+      publishedLast24h: publishedLast24hCount.count,
       analytics: analyticsCount.count,
       dbSize: await this.getDatabaseSize()
     };

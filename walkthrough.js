@@ -347,7 +347,7 @@ class SetupWalkthrough {
 
     try {
       const service = new AITextService(guide.validationCreds(apiKey, model));
-      const reply = await service.generateText('Reply with the single word OK.', { maxTokens: 20, temperature: 0 });
+      const reply = await service.generateText('Reply with the single word OK.', { maxTokens: 20, temperature: 0, purpose: 'setup_probe' });
       return typeof reply === 'string' && reply.length > 0;
     } catch (error) {
       console.log(chalk.red(`  ✗ ${error.message}`));

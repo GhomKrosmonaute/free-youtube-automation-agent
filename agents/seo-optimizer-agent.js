@@ -1,5 +1,7 @@
 const { Logger } = require('../utils/logger');
+const { extractJson } = require('../utils/ai-json');
 const { AITextService } = require('../utils/ai-text-service');
+const { reactProfile } = require('../utils/react-profile');
 
 class SEOOptimizerAgent {
   constructor(db, credentials) {
@@ -51,8 +53,8 @@ class SEOOptimizerAgent {
       // Generate hashtags
       const hashtags = await this.generateHashtags(strategy);
       
-      // Create chapters/timestamps
-      const chapters = await this.generateChapters(script);
+      // Chapters come from the measured narration after production (utils/chapters.js), never from estimates.
+      const chapters = [];
       
       // Generate end screen elements
       const endScreen = await this.generateEndScreenStrategy();
@@ -109,13 +111,22 @@ Topic: ${strategy.topic}
 Angle: ${strategy.angle}
 Content type: ${strategy.contentType}
 Target audience: ${strategy.targetAudience}
+Brand voice: ${strategy.brandVoice || 'clear, credible, and engaging'}
+Channel goal: ${strategy.channelGoal || 'help the viewer understand and act'}
 Keywords: ${(strategy.keywords || []).join(', ')}
-Keep tags under YouTube's 500 character total guidance. Avoid fabricated statistics and unsupported claims.`;
+${String(strategy.contentType || '').toLowerCase() === 'lesson' && reactProfile().lesson?.seoTitleRule
+    ? reactProfile().lesson.seoTitleRule
+    : reactProfile().seo?.titleRule || 'Title rule: the title says clearly what the video answers or shows, worded the way the target audience would type it into YouTube search: specific, intriguing and accurate, under 70 characters when possible, never a promise the video does not deliver, no clickbait.'}
+${reactProfile().seo?.descriptionRule || 'Description rule: the first two lines say what the viewer will get from the video (they are visible before "plus"). Write it in the brand voice, without generic template phrases.'}
+
+Keep tags under YouTube's 500 character total guidance. Avoid fabricated statistics and unsupported claims.
+Do NOT include chapter timestamps, a CHAPITRES/CHAPTERS block, or a sources list in the description: chapters and verified sources are appended automatically after production. Do not mention trending videos or trailers unless they are the actual subject.`;
 
     try {
       const response = await this.aiTextService.generateText(prompt, {
         maxTokens: 1400,
-        temperature: 0.6
+        temperature: 0.6,
+        purpose: 'seo'
       });
       const parsed = this.parseAIJsonResponse(response);
       const tags = this.normalizeAITags(parsed.tags, strategy);
@@ -137,21 +148,7 @@ Keep tags under YouTube's 500 character total guidance. Avoid fabricated statist
   }
 
   parseAIJsonResponse(response) {
-    const text = String(response || '').trim();
-    const withoutFences = text
-      .replace(/^```(?:json)?\s*/i, '')
-      .replace(/```$/i, '')
-      .trim();
-
-    try {
-      return JSON.parse(withoutFences);
-    } catch (error) {
-      const match = withoutFences.match(/\{[\s\S]*\}/);
-      if (!match) {
-        throw error;
-      }
-      return JSON.parse(match[0]);
-    }
+    return extractJson(response);
   }
 
   normalizeAITags(tags, strategy) {
@@ -239,20 +236,6 @@ Keep tags under YouTube's 500 character total guidance. Avoid fabricated statist
     }
     description += '\n';
     
-    // Timestamps/Chapters
-    description += '⏱️ TIMESTAMPS:\n';
-    description += '00:00 Introduction\n';
-    let timestamp = 20;
-    if (script.mainContent && script.mainContent.sections) {
-      script.mainContent.sections.forEach(section => {
-        const minutes = Math.floor(timestamp / 60);
-        const seconds = timestamp % 60;
-        description += `${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')} ${section.title || 'Section'}\n`;
-        timestamp += section.duration || 60;
-      });
-    }
-    description += '\n';
-    
     // Keywords paragraph (SEO optimized)
     description += '📝 ABOUT THIS VIDEO:\n';
     description += `This comprehensive guide on ${strategy.topic} covers everything you need to know. `;
@@ -261,7 +244,6 @@ Keep tags under YouTube's 500 character total guidance. Avoid fabricated statist
     
     // Links section
     description += '🔗 USEFUL LINKS:\n';
-    description += `• Subscribe: [Your Channel URL]\n`;
     description += `• Website: ${process.env.WEBSITE_URL || '[Your Website]'}\n`;
     description += `• Social Media: ${process.env.SOCIAL_LINKS || '[Your Social Media]'}\n\n`;
     
@@ -496,48 +478,6 @@ Keep tags under YouTube's 500 character total guidance. Avoid fabricated statist
     return hashtags.slice(0, 15);
   }
 
-  async generateChapters(script) {
-    const chapters = [];
-    let currentTime = 0;
-    
-    // Introduction
-    chapters.push({
-      time: '00:00',
-      title: 'Introduction',
-      seconds: 0
-    });
-    
-    currentTime = 20; // Intro duration
-    
-    // Main content chapters
-    if (script.mainContent && script.mainContent.sections) {
-      script.mainContent.sections.forEach(section => {
-        const minutes = Math.floor(currentTime / 60);
-        const seconds = currentTime % 60;
-        const timeString = `${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`;
-        
-        chapters.push({
-          time: timeString,
-          title: section.title || 'Section',
-          seconds: currentTime
-        });
-        
-        currentTime += section.duration || 60;
-      });
-    }
-    
-    // Conclusion
-    const conclusionMinutes = Math.floor(currentTime / 60);
-    const conclusionSeconds = currentTime % 60;
-    chapters.push({
-      time: `${conclusionMinutes.toString().padStart(2, '0')}:${conclusionSeconds.toString().padStart(2, '0')}`,
-      title: 'Conclusion & Next Steps',
-      seconds: currentTime
-    });
-    
-    return chapters;
-  }
-
   async generateEndScreenStrategy() {
     return {
       elements: [
@@ -579,7 +519,6 @@ Keep tags under YouTube's 500 character total guidance. Avoid fabricated statist
     // Description scoring (40 points max)
     if (description.length >= 200) score += 10;
     if (description.length >= 500) score += 10;
-    if (description.includes('TIMESTAMPS')) score += 5;
     if (description.includes('http')) score += 5; // Contains links
     if (description.split('\n').length > 10) score += 5; // Well formatted
     if (description.substring(0, 125).includes(tags[0])) score += 5; // Primary keyword in first 125 chars
@@ -618,7 +557,7 @@ Keep tags under YouTube's 500 character total guidance. Avoid fabricated statist
     };
     
     const niche = this.identifyNiche(strategy);
-    return categories[niche] || 22; // Default to People & Blogs
+    return categories[niche] || Number(process.env.DEFAULT_CATEGORY || 22); // Default to People & Blogs unless DEFAULT_CATEGORY is set
   }
 }
 

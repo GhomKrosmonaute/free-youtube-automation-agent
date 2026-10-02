@@ -1,8 +1,19 @@
 const path = require('path');
+const { runFFmpeg, getMediaDuration } = require('../utils/ffmpeg');
+const { scriptScenes } = require('../utils/scene-repair-service');
+const { renderSceneClip, PALETTES, paletteFor } = require('../utils/visualizer');
+const { generateLocalImage, localImageEngine } = require('../utils/image-generator');
+const { composeThumbnail } = require('../utils/thumbnail-composer');
 const fs = require('fs').promises;
 const { Logger } = require('../utils/logger');
 const { AIVideoGenerator } = require('../utils/ai-video-generator');
 const { SceneRepairService } = require('../utils/scene-repair-service');
+const { VisualInsertAgent } = require('./visual-insert-agent');
+const backgroundMusic = require('../utils/background-music');
+const { AITextService } = require('../utils/ai-text-service');
+const { srtFromScenes } = require('../utils/narration-timing');
+const { renderShort, isShortForm } = require('../utils/vertical-short');
+const { registerOf } = require('../utils/content-mode');
 
 class ProductionManagementAgent {
   constructor(db, credentials) {
@@ -13,6 +24,7 @@ class ProductionManagementAgent {
     this.assets = new Map();
     this.aiVideoGenerator = new AIVideoGenerator(credentials, { db });
     this.sceneRepair = new SceneRepairService(db, this.aiVideoGenerator, { logger: this.logger });
+    this.visualInserts = new VisualInsertAgent({ credentials, logger: this.logger });
   }
 
   async initialize() {
@@ -97,14 +109,23 @@ class ProductionManagementAgent {
       // Generate audio narration
       await this.generateAudioNarration(productionData);
       
-      // Generate captions
-      await this.generateCaptions(productionData);
-      
       // Final assembly
       await this.assembleVideo(productionData);
 
       // Persist a scene-addressable production manifest for selective review and repair.
-      await this.sceneRepair.initializeProduction(productionData, this.aiVideoGenerator.lastVideoResult || {});
+      const scenes = await this.sceneRepair.initializeProduction(productionData, this.aiVideoGenerator.lastVideoResult || {});
+
+      // Closed captions on the measured scene timeline, following the voice word by word.
+      await this.generateCaptions(productionData, scenes);
+
+      // A reaction (react mode) is a vertical Short: the narrated scenes laid out for a phone. The 16:9 render is kept.
+      if (isShortForm(strategy) && productionData.assets.finalVideo?.path && !productionData.assets.finalVideo.simulated) {
+        const { captionsPath, ...vertical } = await this.renderShort(productionData, scenes, { db: this.db });
+        productionData.assets.landscapeVideo = productionData.assets.finalVideo;
+        productionData.assets.finalVideo = { ...productionData.assets.finalVideo, ...vertical };
+        if (captionsPath) productionData.assets.captions = { ...productionData.assets.captions, path: captionsPath };
+        this.logger.info(`Vertical Short rendered: ${vertical.duration}s (${vertical.layout})`);
+      }
 
       // Mark as ready — or simulated, when no real video could be produced
       const simulated = Boolean(productionData.assets.finalVideo?.simulated);
@@ -124,6 +145,11 @@ class ProductionManagementAgent {
       this.logger.error('Failed to process content:', error);
       throw error;
     }
+  }
+
+  // Injectable for tests.
+  renderShort(...args) {
+    return renderShort(...args);
   }
 
   generateProductionId() {
@@ -172,14 +198,14 @@ class ProductionManagementAgent {
     
     // Add main content
     if (script.mainContent && script.mainContent.sections) {
-      script.mainContent.sections.forEach((section, index) => {
-        ttsText += `Section ${index + 1}: ${section.title}\n`;
-        
+      script.mainContent.sections.forEach((section) => {
+        // Section titles are internal labels; only the spoken content is narrated.
         if (Array.isArray(section.content)) {
           section.content.forEach(line => {
-            if (typeof line === 'string' && !line.startsWith('[')) {
-              ttsText += `${line}\n`;
-            }
+            // Lines holding [template placeholders] are never narrated.
+            if (typeof line !== 'string' || /\[[^\]]*\]/.test(line)) return;
+            const spoken = line.replace(/\s{2,}/g, ' ').trim();
+            if (spoken) ttsText += `${spoken}\n\n`;
           });
         } else if (section.steps) {
           section.steps.forEach(step => {
@@ -210,9 +236,9 @@ class ProductionManagementAgent {
     
     // Add CTA
     if (script.callToAction) {
-      ttsText += `${script.callToAction.subscribe}\n`;
-      ttsText += `${script.callToAction.like}\n`;
-      ttsText += `${script.callToAction.comment}\n`;
+      for (const line of [script.callToAction.subscribe, script.callToAction.like, script.callToAction.comment]) {
+        if (line) ttsText += `${line}\n`;
+      }
     }
     
     return ttsText;
@@ -258,6 +284,10 @@ class ProductionManagementAgent {
   }
 
   calculatePublishTime(strategy) {
+    // Continuous mode: publish as soon as the video clears its gates.
+    if (String(process.env.PUBLISH_IMMEDIATELY || '').toLowerCase() === 'true') {
+      return new Date(Date.now() + 2 * 60 * 1000).toISOString();
+    }
     // Use strategy's recommended time or calculate optimal time
     if (strategy.bestPublishTime) {
       return strategy.bestPublishTime;
@@ -423,17 +453,32 @@ class ProductionManagementAgent {
     try {
       const audioPath = path.join(__dirname, '..', 'data', 'audio', `${productionData.id}_narration.mp3`);
       
-      // Read the TTS script
-      const ttsText = await fs.readFile(productionData.assets.script.ttsPath, 'utf8');
-      
-      // Generate audio using AI TTS and retain the provider evidence returned by the generator.
-      const generatedPath = await this.aiVideoGenerator.generateTTSAudio(ttsText, audioPath);
-      const evidence = this.aiVideoGenerator.lastNarrationResult || {};
+      // Narrate scene by scene so every scene owns an exactly aligned audio segment, then
+      // concatenate the segments into the master track. Falls back to one whole-script call.
+      let generatedPath;
+      let evidence = {};
+      let segments = [];
+      try {
+        segments = await this.generateSceneNarration(productionData);
+        generatedPath = await this.concatenateNarration(productionData.id, segments, audioPath);
+        evidence = this.aiVideoGenerator.lastNarrationResult || {};
+      } catch (sceneError) {
+        this.logger.warn(`Per-scene narration failed, narrating the whole script instead: ${sceneError.message}`);
+        segments = [];
+        const ttsText = await fs.readFile(productionData.assets.script.ttsPath, 'utf8');
+        generatedPath = await this.aiVideoGenerator.generateTTSAudio(ttsText, audioPath);
+        evidence = this.aiVideoGenerator.lastNarrationResult || {};
+      }
       const usable = await this.aiVideoGenerator.isUsableAudioFile(generatedPath);
+      const measuredSeconds = segments.length
+        ? segments.reduce((sum, segment) => sum + segment.duration, 0)
+        : (usable ? await getMediaDuration(generatedPath).catch(() => null) : null);
 
       productionData.assets.audio = {
         path: generatedPath,
-        duration: productionData.estimatedDuration,
+        duration: measuredSeconds ? this.formatSeconds(measuredSeconds) : productionData.estimatedDuration,
+        durationSeconds: measuredSeconds || null,
+        segments,
         format: 'mp3',
         generatedWith: 'AI',
         quality: usable ? 'high' : null,
@@ -456,113 +501,64 @@ class ProductionManagementAgent {
     }
   }
 
-  async generateCaptions(productionData) {
+  async generateSceneNarration(productionData) {
+    const scenes = scriptScenes(productionData.script || {});
+    if (scenes.length < 2) throw new Error('Script has no scene breakdown');
+    const directory = path.join(__dirname, '..', 'data', 'audio', 'scenes', productionData.id);
+    await fs.mkdir(directory, { recursive: true });
+    const segments = [];
+    for (const [position, scene] of scenes.entries()) {
+      const segmentPath = path.join(directory, `${String(position).padStart(3, '0')}_r1.mp3`);
+      const text = String(scene.scriptText || '').trim();
+      if (!text) {
+        await runFFmpeg(['-y', '-f', 'lavfi', '-t', '1', '-i', 'anullsrc=r=44100:cl=stereo', '-c:a', 'libmp3lame', segmentPath]);
+      } else {
+        const generated = await this.aiVideoGenerator.generateTTSAudio(text, segmentPath, {
+          previousText: String(scenes[position - 1]?.scriptText || ''),
+          nextText: String(scenes[position + 1]?.scriptText || '')
+        });
+        if (!await this.aiVideoGenerator.isUsableAudioFile(generated)) throw new Error(`No usable narration for scene "${scene.label}"`);
+      }
+      const duration = Number(await getMediaDuration(segmentPath));
+      if (!Number.isFinite(duration) || duration <= 0) throw new Error(`Could not measure narration for scene "${scene.label}"`);
+      segments.push({ position, label: scene.label, text, prompt: scene.prompt || '', register: registerOf(scene.register), path: segmentPath, duration: Number(duration.toFixed(2)), ...(scene.illustration ? { illustration: scene.illustration } : {}) });
+      this.logger.info(`Narrated scene ${position + 1}/${scenes.length} "${scene.label}" (${duration.toFixed(1)}s)`);
+    }
+    return segments;
+  }
+
+  async concatenateNarration(productionId, segments, outputPath) {
+    const listPath = path.join(path.dirname(segments[0].path), 'concat.txt');
+    await fs.writeFile(listPath, segments.map(segment => `file '${segment.path.replace(/'/g, "'\\''")}'`).join('\n') + '\n');
+    await fs.mkdir(path.dirname(outputPath), { recursive: true });
+    await runFFmpeg(['-y', '-f', 'concat', '-safe', '0', '-i', listPath, '-ar', '44100', '-ac', '2', '-c:a', 'libmp3lame', '-b:a', '160k', outputPath]);
+    await fs.unlink(listPath).catch(() => {});
+    return outputPath;
+  }
+
+  formatSeconds(seconds) {
+    const total = Math.round(Number(seconds) || 0);
+    return `${Math.floor(total / 60)}:${String(total % 60).padStart(2, '0')}`;
+  }
+
+  async generateCaptions(productionData, scenes) {
     this.logger.info('Generating captions...');
     
     const captionsPath = path.join(__dirname, '..', 'data', 'captions', `${productionData.id}_captions.srt`);
-    
-    // Generate SRT captions based on script timing
-    const captions = await this.createSRTCaptions(productionData);
-    
     await fs.mkdir(path.dirname(captionsPath), { recursive: true });
-    await fs.writeFile(captionsPath, captions);
+    await fs.writeFile(captionsPath, await srtFromScenes(scenes || []));
     
     productionData.assets.captions = {
       path: captionsPath,
       format: 'srt',
       language: process.env.CONTENT_LANGUAGE || 'en',
-      autoGenerated: true
+      autoGenerated: true,
+      sceneAware: true
     };
     
     productionData.timeline.captionsGenerated = new Date().toISOString();
     
     return captionsPath;
-  }
-
-  async createSRTCaptions(productionData) {
-    const { script } = productionData;
-    let srt = '';
-    let captionIndex = 1;
-    let currentTime = 0;
-    
-    // Helper function to format time for SRT
-    const formatSRTTime = (seconds) => {
-      const hours = Math.floor(seconds / 3600);
-      const minutes = Math.floor((seconds % 3600) / 60);
-      const secs = Math.floor(seconds % 60);
-      const ms = Math.floor((seconds % 1) * 1000);
-      
-      return `${hours.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')},${ms.toString().padStart(3, '0')}`;
-    };
-    
-    // Process script sections for captions
-    const processText = (text, startTime, duration) => {
-      const words = text.split(' ');
-      const wordsPerCaption = 8; // Optimal words per caption
-      
-      for (let i = 0; i < words.length; i += wordsPerCaption) {
-        const captionWords = words.slice(i, i + wordsPerCaption);
-        const captionDuration = (duration / Math.ceil(words.length / wordsPerCaption));
-        const captionStartTime = startTime + (i / words.length) * duration;
-        const captionEndTime = captionStartTime + captionDuration;
-        
-        srt += `${captionIndex}\n`;
-        srt += `${formatSRTTime(captionStartTime)} --> ${formatSRTTime(captionEndTime)}\n`;
-        srt += `${captionWords.join(' ')}\n\n`;
-        
-        captionIndex++;
-      }
-    };
-    
-    // Hook
-    if (script.hook && script.hook.text) {
-      processText(script.hook.text, currentTime, 5);
-      currentTime += 5;
-    }
-    
-    // Introduction
-    if (script.introduction) {
-      const introText = `${script.introduction.greeting} ${script.introduction.topicIntro} ${script.introduction.valueProposition}`;
-      processText(introText, currentTime, 15);
-      currentTime += 15;
-    }
-    
-    // Main content
-    if (script.mainContent && script.mainContent.sections) {
-      script.mainContent.sections.forEach(section => {
-        let sectionText = '';
-        
-        if (Array.isArray(section.content)) {
-          sectionText = section.content.filter(line => 
-            typeof line === 'string' && !line.startsWith('[')
-          ).join(' ');
-        } else if (section.steps) {
-          sectionText = section.steps.map(step => 
-            `${step.title}. ${step.description}`
-          ).join(' ');
-        } else if (section.items) {
-          sectionText = section.items.map(item => 
-            `Number ${item.number}: ${item.title}. ${item.description}`
-          ).join(' ');
-        } else if (typeof section.content === 'string') {
-          sectionText = section.content;
-        }
-        
-        if (sectionText) {
-          processText(sectionText, currentTime, section.duration || 60);
-          currentTime += section.duration || 60;
-        }
-      });
-    }
-    
-    // Conclusion
-    if (script.conclusion) {
-      const conclusionText = script.conclusion.recap.join(' ') + ' ' + script.conclusion.finalThought;
-      processText(conclusionText, currentTime, 30);
-      currentTime += 30;
-    }
-    
-    return srt;
   }
 
   async assembleVideo(productionData) {
@@ -574,6 +570,52 @@ class ProductionManagementAgent {
       if (!narrationReady && productionData.assets.audio?.intentionalSilence !== true) {
         this.logger.warn('Final assembly is blocked until narration succeeds or the operator explicitly confirms an intentional silent video.');
         return await this.simulateVideoAssembly(productionData, 'Narration is missing');
+      }
+
+      // Audio-reactive visualizer: one FFmpeg clip per narrated scene, then concatenated. Free, fast, no AI media model.
+      const visualMode = String(process.env.VISUAL_MODE || 'illustrated').toLowerCase();
+      const segments = productionData.assets.audio?.segments || [];
+      if (['visualizer', 'illustrated'].includes(visualMode) && segments.length) {
+        const clips = await this.renderVisualizerClips(productionData, segments);
+        const soundtrack = await this.prepareSoundtrack(productionData, segments);
+        await this.concatenateClips(clips, soundtrack || productionData.assets.audio.path, finalVideoPath);
+        if (soundtrack) await fs.unlink(soundtrack).catch(() => {});
+        this.aiVideoGenerator.lastVideoResult = {
+          requestedProvider: 'visualizer', actualProvider: 'visualizer', model: 'ffmpeg-showwaves', mode: 'visualizer',
+          generatedSeconds: 0, tasks: [],
+          scenes: clips.map(clip => ({ index: clip.index, label: clip.label, prompt: '', duration: clip.duration, path: clip.path, taskId: null, provider: 'visualizer', model: 'ffmpeg-showwaves' }))
+        };
+        const stats = await fs.stat(finalVideoPath);
+        productionData.assets.finalVideo = {
+          path: finalVideoPath, fileSize: stats.size,
+          duration: productionData.assets.audio.duration || productionData.estimatedDuration,
+          generatedWith: 'ffmpeg-visualizer', resolution: '1920x1080', format: 'mp4',
+          provider: this.aiVideoGenerator.lastVideoResult
+        };
+        productionData.containsSyntheticMedia = false;
+        // Real thumbnail: a dedicated illustration (subject on the right, room for the headline on the left)
+        // in the register of the opening, falling back to the first scene illustration.
+        const illustrated = segments.find(segment => segment.imagePath);
+        if (illustrated) {
+          try {
+            const thumbnailPath = path.join(__dirname, '..', 'data', 'thumbnails', `${productionData.id}_thumbnail.jpg`);
+            const register = registerOf(segments[0]?.register);
+            const imagePath = await this.generateThumbnailIllustration(productionData, register) || illustrated.imagePath;
+            await composeThumbnail({
+              imagePath, title: productionData.script?.title || '', text: productionData.script?.thumbnailText || '',
+              outputPath: thumbnailPath, accent: PALETTES[paletteFor(register, process.env.VISUAL_PALETTE)]?.accent
+            });
+            const thumbStats = await fs.stat(thumbnailPath);
+            productionData.assets.thumbnail = {
+              ...(productionData.assets.thumbnail || {}), path: thumbnailPath, originalPath: imagePath,
+              dimensions: { width: 1280, height: 720 }, fileSize: thumbStats.size, generatedWith: 'illustration+ffmpeg', simulated: false
+            };
+          } catch (error) {
+            this.logger.warn(`Thumbnail composition failed: ${error.message.slice(0, 200)}`);
+          }
+        }
+        this.logger.info(`Visualizer video assembled from ${clips.length} scene clips`);
+        return finalVideoPath;
       }
 
       // Use AI Video Generator to create the final video
@@ -608,7 +650,7 @@ class ProductionManagementAgent {
       };
       productionData.containsSyntheticMedia = Boolean(
         this.aiVideoGenerator.lastVideoResult?.actualProvider &&
-        !['slideshow', 'simulation'].includes(this.aiVideoGenerator.lastVideoResult.actualProvider)
+        !['slideshow', 'simulation', 'visualizer'].includes(this.aiVideoGenerator.lastVideoResult.actualProvider)
       );
       
       this.logger.info('AI video assembly complete');
@@ -618,6 +660,130 @@ class ProductionManagementAgent {
       // Fallback to simulation
       return await this.simulateVideoAssembly(productionData);
     }
+  }
+
+  async renderVisualizerClips(productionData, segments) {
+    const directory = path.join(__dirname, '..', 'data', 'assets', 'scenes', productionData.id);
+    await fs.mkdir(directory, { recursive: true });
+    const clips = [];
+    const inserts = await this.prepareVisualInserts(productionData, segments, directory);
+    const illustrate = String(process.env.VISUAL_MODE || 'illustrated').toLowerCase() === 'illustrated' && localImageEngine();
+    let previousImage = null;
+    for (const segment of segments) {
+      const clipPath = path.join(directory, `${String(segment.position).padStart(3, '0')}_r1.mp4`);
+      let imagePath = null;
+      if (illustrate && segment.illustration === 'previous' && previousImage) {
+        imagePath = previousImage;
+      } else if (illustrate) {
+        const candidate = path.join(directory, `${String(segment.position).padStart(3, '0')}_illustration.png`);
+        const prompt = segment.prompt || `${productionData.script?.title || ''}. ${segment.label || ''}`;
+        try {
+          imagePath = await generateLocalImage({ prompt, outputPath: candidate, logger: this.logger, register: segment.register });
+        } catch (error) {
+          this.logger.warn(`Illustration failed for scene "${segment.label}", using the spectrum look: ${error.message.slice(0, 200)}`);
+        }
+      }
+      await renderSceneClip({
+        audioPath: segment.path, outputPath: clipPath, imagePath,
+        title: productionData.script?.title || '', label: segment.label || '', text: segment.text || '',
+        durationSeconds: segment.duration, palette: process.env.VISUAL_PALETTE,
+        register: segment.register, showTitle: segment.position === 0, inserts: inserts.get(segment.position) || []
+      });
+      if (imagePath) {
+        segment.imagePath = imagePath;
+        previousImage = imagePath;
+      }
+      clips.push({ index: segment.position, label: segment.label, path: clipPath, duration: segment.duration });
+      this.logger.info(`Rendered visualizer clip ${segment.position + 1}/${segments.length} "${segment.label}"`);
+    }
+    return clips;
+  }
+
+  // Cards over the scenes (scripture, equations, portraits, documents...), timed on the narration. Optional: if the
+  // agent fails, the scenes are rendered without cards. Credits are kept for the video description.
+  async prepareVisualInserts(productionData, segments, directory) {
+    if (!VisualInsertAgent.enabled()) return new Map();
+    try {
+      const result = await this.visualInserts.prepare({
+        script: productionData.script || {},
+        segments,
+        outputDir: path.join(directory, 'inserts'),
+        cacheDir: path.join(__dirname, '..', 'data', 'assets', 'insert-cache')
+      });
+      productionData.assets.inserts = { items: result.items, credits: result.credits };
+      for (const segment of segments) {
+        if (result.byScene.has(segment.position)) segment.inserts = result.byScene.get(segment.position);
+      }
+      return result.byScene;
+    } catch (error) {
+      this.logger.warn(`Visual inserts skipped: ${error.message.slice(0, 200)}`);
+      return new Map();
+    }
+  }
+
+  // Narration with ambient music under it (utils/background-music.js). Without tracks in data/music, or if the mix
+  // fails, the video keeps the bare narration.
+  async prepareSoundtrack(productionData, segments) {
+    if (!backgroundMusic.enabled()) return null;
+    try {
+      await this.chooseMusicAmbiances(productionData, segments);
+      const result = await backgroundMusic.mixSoundtrack({
+        narrationPath: productionData.assets.audio.path,
+        segments,
+        outputPath: path.join(__dirname, '..', 'data', 'audio', `${productionData.id}_soundtrack.flac`),
+        key: productionData.id
+      });
+      if (!result) {
+        this.logger.info(`No background music: add tracks to ${backgroundMusic.musicDir()}`);
+        return null;
+      }
+      productionData.assets.music = { tracks: result.tracks, credits: result.credits };
+      this.logger.info(`Background music: ${result.tracks.map(track => `${track.file} (${track.ambiance})`).join(', ')}`);
+      return result.path;
+    } catch (error) {
+      this.logger.warn(`Background music skipped: ${error.message.slice(0, 200)}`);
+      return null;
+    }
+  }
+
+  // With folders beyond the default ones in data/music, the model gives each scene an ambiance that fits what it says
+  // (and, in a two-part video, each part). On failure every scene keeps its part's default music.
+  async chooseMusicAmbiances(productionData, segments) {
+    const names = await backgroundMusic.ambiances();
+    if (!names.some(name => !Object.values(backgroundMusic.defaults()).includes(name))) return;
+    try {
+      this.aiText = this.aiText || new AITextService(this.credentials?.credentials || this.credentials || {});
+      const choices = await backgroundMusic.chooseAmbiances({ aiText: this.aiText, script: productionData.script || {}, segments, names });
+      for (const segment of segments) segment.ambiance = choices.get(segment.position);
+    } catch (error) {
+      this.logger.warn(`Music ambiances skipped, each phase keeps its default music: ${error.message.slice(0, 200)}`);
+    }
+  }
+
+  async generateThumbnailIllustration(productionData, register) {
+    if (!localImageEngine()) return null;
+    const script = productionData.script || {};
+    const subject = script.thumbnailImagePrompt || script.hookImagePrompt || script.title || '';
+    if (!subject) return null;
+    const outputPath = path.join(__dirname, '..', 'data', 'assets', 'scenes', productionData.id, 'thumbnail_illustration.png');
+    try {
+      return await generateLocalImage({
+        prompt: `${subject}. The main subject is large and close, placed in the right third of the frame; the left half is calm, dark, empty negative space`,
+        outputPath, register, logger: this.logger
+      });
+    } catch (error) {
+      this.logger.warn(`Thumbnail illustration failed, reusing a scene illustration: ${error.message.slice(0, 200)}`);
+      return null;
+    }
+  }
+
+  async concatenateClips(clips, masterAudioPath, outputPath) {
+    const listPath = path.join(path.dirname(clips[0].path), 'concat.txt');
+    await fs.writeFile(listPath, clips.map(clip => `file '${clip.path.replace(/'/g, "'\\''")}'`).join('\n') + '\n');
+    await fs.mkdir(path.dirname(outputPath), { recursive: true });
+    await runFFmpeg(['-y', '-f', 'concat', '-safe', '0', '-i', listPath, '-i', masterAudioPath, '-map', '0:v:0', '-map', '1:a:0', '-c:v', 'copy', '-c:a', 'aac', '-b:a', '160k', '-shortest', '-movflags', '+faststart', outputPath]);
+    await fs.unlink(listPath).catch(() => {});
+    return outputPath;
   }
 
   async getPipelineStatus() {

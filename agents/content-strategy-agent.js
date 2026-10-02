@@ -1,5 +1,15 @@
 const { Logger } = require('../utils/logger');
+const { extractJson } = require('../utils/ai-json');
 const { AITextService } = require('../utils/ai-text-service');
+const { techniques, getTechnique } = require('../utils/techniques');
+const { isReactMode } = require('../utils/content-mode');
+const { reactProfile } = require('../utils/react-profile');
+
+// React mode: one video in `lesson.every` (react profile) teaches one of its techniques (the "lesson" format).
+function lessonEvery() {
+  const every = Math.round(Number(reactProfile().lesson?.every));
+  return every >= 2 && techniques().length ? every : 0;
+}
 
 class ContentStrategyAgent {
   constructor(db, credentials) {
@@ -288,7 +298,7 @@ class ContentStrategyAgent {
     const approvedLearnings = this.db.listLearningRecommendations
       ? await this.db.listLearningRecommendations({ status: 'approved', limit: 10 })
       : [];
-    const signals = this.trendingTopics.slice(0, 15).map(item => ({
+    const signals = this.usableTrends().slice(0, 15).map(item => ({
       topic: item.topic,
       score: Number(item.score || 0),
       sources: [...new Set(item.sources || [])],
@@ -298,12 +308,15 @@ class ContentStrategyAgent {
       signals.flatMap(signal => signal.evidence || []).map(source => [source.url, source])
     ).values()].slice(0, 30);
     const signalSources = new Set(signals.flatMap(signal => signal.sources));
+    const gaps = await this.openGaps();
     const researchSources = [
+      ...(gaps.length ? ['Measured topic gaps (YouTube demand against existing answers)'] : []),
       ...(signalSources.has('trending') ? ['YouTube most-popular videos'] : []),
       ...(signalSources.has('competitor') ? ['Configured competitor channels'] : []),
       ...(recentRows.length ? ['Channel content history'] : []),
       ...(approvedLearnings.length ? ['Operator-approved channel performance learnings'] : [])
     ];
+    const lessonDue = await this.lessonDue();
     const research = {
       generatedAt: new Date().toISOString(),
       sources: researchSources.length ? researchSources : ['No usable live signals returned; evergreen strategy fallback'],
@@ -317,7 +330,10 @@ class ContentStrategyAgent {
         rationale: item.rationale,
         confidence: item.confidence,
         proposedChange: item.proposedChange
-      }))
+      })),
+      lessonDue,
+      // Claims widely defended on YouTube and rarely answered (utils/topic-gap-finder.js); never sources of a script.
+      gaps: gaps.map(gap => ({ gapId: gap.id, claim: gap.claim, pillar: gap.pillar, supportingViews: gap.demandViews, answeringViews: gap.supplyViews }))
     };
 
     let plan = await this.generateAutonomousPlanWithAI(channelStrategy, research, targetCount);
@@ -335,7 +351,7 @@ class ContentStrategyAgent {
     const prompt = `You are the strategy lead for an autonomous YouTube channel.
 Turn the channel strategy and the supplied research signals into a focused content plan.
 Return only a valid JSON array with exactly ${targetCount} items using this shape:
-[{"topic":"specific video topic","pillar":"one exact content pillar from the supplied strategy","angle":"distinct audience-relevant angle","rationale":"why this advances the channel objective using the supplied evidence","format":"explainer|tutorial|list|review|story","length":"short|medium|long","sourceUrls":["exact URL from the supplied source catalog"]}]
+[{"topic":"specific video topic","pillar":"one exact content pillar from the supplied strategy","angle":"distinct audience-relevant angle","rationale":"why this advances the channel objective using the supplied evidence","format":"explainer|tutorial|list|review|story","length":"short|medium|long","sourceUrls":["exact URL from the supplied source catalog"],"gapId":"the gapId of the measured gap this item answers, or empty"}]
 
 Language: write topic, angle and rationale in the language with ISO code "${process.env.CONTENT_LANGUAGE || 'en'}".
 Channel objective: ${channelStrategy.objective}
@@ -353,11 +369,16 @@ Research signals: ${JSON.stringify(research.signals)}
 Allowed source catalog: ${JSON.stringify(research.sourceCatalog)}
 Recent topics to avoid repeating: ${JSON.stringify(research.recentTopics)}
 Operator-approved performance learnings to apply: ${JSON.stringify(research.approvedLearnings)}
-
+${research.gaps.length ? `Measured gaps: claims that many people watch being supported on YouTube and few watch being answered. Plan the other items on these first, the widest gap (most supporting views, fewest answering views) first, unless one does not fit the channel; for such an item, copy its gapId and keep the claim's substance in the topic, worded as the people who hold it search for it. ${JSON.stringify(research.gaps)}
+` : ''}${research.lessonDue ? `${typeof reactProfile().lesson?.plannerRule === 'function'
+    ? reactProfile().lesson.plannerRule(research.lessonDue)
+    : `Lesson video due: the FIRST item uses format "lesson" and teaches the technique "${research.lessonDue.name}" (${research.lessonDue.definition}) through examples from several subjects. Its topic is the question a curious viewer asks about the pattern (for example "${research.lessonDue.question}"); never the name of the technique.`} The other items follow the rules below.
+` : ''}
+${reactProfile().planner?.topicRule || 'Topic wording: each topic becomes the working title of the video, so write it the way the target audience would search for it on YouTube: specific and intriguing, never a promise the video will not deliver; use the question the video answers when that is clearer.'}
 Do not invent trend data, statistics, sources, URLs, or factual claims. Use only exact URLs from the supplied source catalog. Apply only the supplied approved learnings; pending or rejected recommendations are not authorized. Prefer evergreen topics when the supplied signals are weak. Learnings with category "audience_demand" are audience-requested topics mined from real comments on published videos; prefer planning a video that directly answers one when it fits the channel objective, and cite it in the rationale.`;
 
     try {
-      const response = await this.aiTextService.generateText(prompt, { maxTokens: 1800, temperature: 0.65 });
+      const response = await this.aiTextService.generateText(prompt, { maxTokens: 1800, temperature: 0.65, purpose: 'autonomous_plan' });
       const parsed = this.parseAIJsonResponse(response);
       return Array.isArray(parsed) ? parsed : Array.isArray(parsed.plan) ? parsed.plan : [];
     } catch (error) {
@@ -372,8 +393,11 @@ Do not invent trend data, statistics, sources, URLs, or factual claims. Use only
       .map(signal => signal.topic)
       .filter(topic => topic.includes(' ') && topic.length >= 8 && !recent.has(topic.toLowerCase()));
     const pillars = channelStrategy.contentPillars || [];
-    const pillarTopics = pillars.map(pillar => `${pillar}: a practical guide for ${channelStrategy.audience}`);
-    const candidates = [...readableSignals, ...pillarTopics, ...this.getEvergreenFallbackTopics()];
+    const lang = process.env.CONTENT_LANGUAGE || 'en';
+    const pillarTopics = pillars.map(pillar => lang === 'fr'
+      ? `${pillar} : le point de départ`
+      : `${pillar}: a practical guide for ${channelStrategy.audience}`);
+    const candidates = [...readableSignals, ...pillarTopics, ...(lang === 'en' ? this.getEvergreenFallbackTopics() : [])];
 
     return candidates.slice(0, targetCount).map((topic, index) => ({
       topic,
@@ -390,13 +414,78 @@ Do not invent trend data, statistics, sources, URLs, or factual claims. Use only
     }));
   }
 
+  // A lesson teaches one technique instead of examining one claim: due once `every - 1` videos have been completed
+  // since the last one (or since the start), on the technique taught least recently and, among those never taught, the
+  // one the channel's examined claims rely on most.
+  async lessonDue() {
+    const every = lessonEvery();
+    if (!every) return null;
+    const jobs = await this.db.getAllRows(
+      "SELECT style FROM generation_jobs WHERE status = 'completed' ORDER BY completed_at DESC LIMIT 50"
+    ).catch(() => []);
+    const sinceLast = jobs.findIndex(job => String(job.style || '').toLowerCase() === 'lesson');
+    if ((sinceLast === -1 ? jobs.length : sinceLast) < every - 1) return null;
+    const technique = await this.nextTechnique();
+    return { technique: technique.id, name: technique.name, definition: technique.definition, question: technique.question };
+  }
+
+  // The widest measured gaps not yet planned (utils/topic-gap-finder.js).
+  async openGaps() {
+    if (!isReactMode()) return [];
+    return this.db.listTopicGaps ? this.db.listTopicGaps({ status: 'open', limit: 8 }).catch(() => []) : [];
+  }
+
+  async nextTechnique() {
+    const parse = value => { try { return JSON.parse(value || 'null'); } catch (_error) { return null; } };
+    const snapshots = await this.db.getAllRows(
+      'SELECT strategy, script, created_at FROM production_snapshots ORDER BY created_at DESC LIMIT 200'
+    ).catch(() => []);
+    const lastTaught = new Map();
+    const relied = new Map();
+    for (const row of snapshots) {
+      const taught = getTechnique(parse(row.strategy)?.technique);
+      if (taught && !lastTaught.has(taught.id)) lastTaught.set(taught.id, row.created_at || '');
+      for (const id of parse(row.script)?.examinedClaim?.techniques || []) relied.set(id, (relied.get(id) || 0) + 1);
+    }
+    return [...techniques()].sort((a, b) =>
+      (lastTaught.get(a.id) || '').localeCompare(lastTaught.get(b.id) || '') || (relied.get(b.id) || 0) - (relied.get(a.id) || 0))[0];
+  }
+
+  // The lesson leads the plan when one is due (the model's, or one built from the technique's question) and never
+  // appears otherwise. Runs twice on the same plan, so it must not add a second one.
+  placeLesson(items, channelStrategy, research) {
+    const due = research.lessonDue;
+    const regular = items.filter(item => item.format !== 'lesson');
+    if (!due) return regular;
+    const proposed = items.find(item => item.format === 'lesson');
+    const technique = getTechnique(due.technique);
+    const lesson = {
+      topic: proposed?.topic || technique.question,
+      pillar: proposed?.pillar || '',
+      angle: proposed?.angle || `${technique.name} : ${technique.definition}`,
+      rationale: proposed?.rationale || reactProfile().lesson?.rationale || `Lesson: ${technique.name}, recognised across several subjects.`,
+      format: 'lesson',
+      length: proposed?.length || channelStrategy.default_length,
+      sourceUrls: proposed?.sourceUrls || [],
+      technique: technique.id,
+      origin: 'lesson'
+    };
+    return [lesson, ...regular.filter(item => item.topic.toLowerCase() !== lesson.topic.toLowerCase())];
+  }
+
   normalizeAutonomousPlan(plan, channelStrategy, targetCount, research = {}) {
-    const formats = new Set(['explainer', 'tutorial', 'list', 'review', 'story']);
+    const formats = new Set(['explainer', 'tutorial', 'list', 'review', 'story', ...(lessonEvery() ? ['lesson'] : [])]);
     const lengths = new Set(['short', 'medium', 'long']);
     const allowedSourceUrls = new Set((research.sourceCatalog || []).map(source => source.url));
     const pillars = channelStrategy.contentPillars || [];
+    const gaps = new Map((research.gaps || []).map(gap => [gap.gapId, gap]));
+    // An item answering a measured gap carries it (and the claim as measured) to the job; unknown ids are dropped.
+    const gapOf = item => {
+      const gap = gaps.get(String(item.gapId || '').trim());
+      return gap ? { gapId: gap.gapId, claim: gap.claim, origin: 'gap' } : {};
+    };
     const seen = new Set();
-    return plan
+    const normalized = plan
       .map(item => ({
         topic: String(item.topic || '').trim().slice(0, 200),
         pillar: pillars.find(pillar => String(pillar).toLowerCase() === String(item.pillar || '').trim().toLowerCase()) || '',
@@ -410,15 +499,23 @@ Do not invent trend data, statistics, sources, URLs, or factual claims. Use only
           : channelStrategy.default_length,
         sourceUrls: [...new Set((Array.isArray(item.sourceUrls) ? item.sourceUrls : [])
           .map(url => String(url))
-          .filter(url => allowedSourceUrls.has(url)))]
+          .filter(url => allowedSourceUrls.has(url)))],
+        ...gapOf(item)
       }))
       .filter(item => {
         const key = item.topic.toLowerCase();
         if (!item.topic || seen.has(key)) return false;
         seen.add(key);
         return true;
-      })
-      .slice(0, targetCount);
+      });
+    return this.placeLesson(normalized, channelStrategy, research).slice(0, targetCount);
+  }
+
+  // General YouTube trends (films, trailers, sport...) are noise for a niche channel and leaked into scripts
+  // as hooks; they are only used when STRATEGY_USE_TRENDING=true. Competitor signals are always kept.
+  usableTrends() {
+    if (String(process.env.STRATEGY_USE_TRENDING || '').toLowerCase() === 'true') return this.trendingTopics;
+    return this.trendingTopics.filter(item => (item.sources || []).some(source => source !== 'trending'));
   }
 
   async generateContentStrategyWithAI(requestedTopic = null) {
@@ -427,7 +524,7 @@ Do not invent trend data, statistics, sources, URLs, or factual claims. Use only
       return null;
     }
 
-    const trendingTopics = this.trendingTopics
+    const trendingTopics = this.usableTrends()
       .slice(0, 10)
       .map(topic => topic.topic)
       .join(', ');
@@ -443,14 +540,15 @@ Return only valid JSON with this exact shape:
 
 Language: write topic, angle, targetAudience and keywords in the language with ISO code "${process.env.CONTENT_LANGUAGE || 'en'}".
 Requested topic: ${requestedTopic || 'none'}
-Trending topics available: ${trendingTopics || 'Technology Trends'}
+Trending topics available: ${trendingTopics || 'none'}
 Channel target audience: ${process.env.TARGET_AUDIENCE || 'General audience interested in educational content'}
 Avoid fabricated claims and unsupported numbers.`;
 
     try {
       const response = await this.aiTextService.generateText(prompt, {
         maxTokens: 1000,
-        temperature: 0.7
+        temperature: 0.7,
+        purpose: 'strategy'
       });
       const parsed = this.parseAIJsonResponse(response);
       const topic = String(parsed.topic || requestedTopic || '').trim();
@@ -483,21 +581,7 @@ Avoid fabricated claims and unsupported numbers.`;
   }
 
   parseAIJsonResponse(response) {
-    const text = String(response || '').trim();
-    const withoutFences = text
-      .replace(/^```(?:json)?\s*/i, '')
-      .replace(/```$/i, '')
-      .trim();
-
-    try {
-      return JSON.parse(withoutFences);
-    } catch (error) {
-      const match = withoutFences.match(/\{[\s\S]*\}/);
-      if (!match) {
-        throw error;
-      }
-      return JSON.parse(match[0]);
-    }
+    return extractJson(response);
   }
 
   normalizeContentType(contentType, topic) {

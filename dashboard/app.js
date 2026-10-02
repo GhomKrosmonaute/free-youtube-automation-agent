@@ -112,9 +112,14 @@ function renderDashboard() {
   const state = ui.state;
   const reviews = state.pipeline.filter(item => ['needs_review', 'needs_attention'].includes(item.review_status));
   const scheduled = state.schedule.filter(item => item.status === 'scheduled');
-  const actionableJobs = state.jobs.filter(job => ['queued', 'running', 'failed', 'interrupted'].includes(job.status));
+  const actionableJobs = state.jobs.filter(job => ['queued', 'running', 'failed', 'interrupted', 'waiting_expert'].includes(job.status));
 
   $('#brand-name').textContent = state.profile?.channel_name || 'Automation Studio';
+  // Options of react mode (CONTENT_MODE=react) only.
+  document.querySelectorAll('[data-react-only]').forEach(option => {
+    option.hidden = state.system.contentMode !== 'react';
+    option.disabled = state.system.contentMode !== 'react';
+  });
   $('#setup-banner').classList.toggle('hidden', !state.system.setupRequired);
   $('#system-label').textContent = state.system.setupRequired
     ? 'Setup required'
@@ -392,7 +397,7 @@ function renderLearning(learning = {}) {
     ['Performance', baseline.performanceScore, '/100']
   ];
   $('#learning-baseline').innerHTML = learning.measuredVideos ? metrics.map(([name, value, suffix]) => `
-    <div><span>${escapeHTML(name)}</span><strong>${Number(value || 0).toFixed(1)}${escapeHTML(suffix)}</strong></div>`).join('') : empty('Two real measurements unlock evidence-backed recommendations.');
+    <div><span>${escapeHTML(name)}</span><strong>${value === null || value === undefined ? '—' : `${Number(value).toFixed(1)}${escapeHTML(suffix)}`}</strong></div>`).join('') : empty('Two real measurements unlock evidence-backed recommendations.');
 
   const recommendations = Array.isArray(learning.recommendations) ? learning.recommendations : [];
   $('#learning-recommendations').innerHTML = recommendations.length ? recommendations.map(item => `
@@ -481,7 +486,8 @@ function renderRetention(retention = {}) {
     `${summary.dropoffCount || 0} drop-offs`,
     `${summary.rewatchCount || 0} rewatch signals`,
     `${escapeHTML(label(snapshot.confidence))} confidence`,
-    `${escapeHTML(snapshot.measurementWindow)} window`
+    `${escapeHTML(snapshot.measurementWindow)} window`,
+    ...(summary.turn?.kept !== null && summary.turn?.kept !== undefined ? [`${escapeHTML(String(summary.turn.kept))}% kept after the turn`] : [])
   ].map(item => `<span>${item}</span>`).join('');
   $('#retention-chart').innerHTML = retentionChart(snapshot);
   $('#retention-scenes').innerHTML = (snapshot.sceneMetrics || []).map(scene => `
@@ -549,12 +555,24 @@ function renderEngagementDetail() {
   ].map(item => `<span>${escapeHTML(item)}</span>`).join('');
 
   const themes = Array.isArray(insight.themes) ? insight.themes : [];
-  $('#engagement-themes').innerHTML = themes.length ? themes.map(theme => `
+  // Persuasion (react mode): the stances the comments take, with the react profile's labels.
+  const persuasion = insight.persuasion || {};
+  const stanceLabels = persuasion.labels || Object.fromEntries(Object.keys(persuasion.counts || {}).map(key => [key, key]));
+  const goalRate = persuasion.goalRate ?? null;
+  const reachRate = persuasion.reachRate ?? null;
+  const persuasionCard = persuasion.classified ? `
+    <article class="learning-card">
+      <div class="learning-card-heading"><strong>Persuasion</strong>${goalRate === null ? '' : statusChip(`${goalRate}% ${persuasion.goalLabel || 'goal'}`)}</div>
+      <p>${Object.entries(stanceLabels).map(([key, name]) => `${escapeHTML(String(persuasion.counts?.[key] || 0))} ${escapeHTML(name)}`).join(' · ')}</p>
+      <div class="learning-meta"><span>${escapeHTML(String(persuasion.classified))} comments classified</span>${reachRate === null ? '' : `<span>${escapeHTML(String(reachRate))}% of the audience to reach</span>`}</div>
+      ${(persuasion.examples || []).map(item => `<p class="comment-original"><a href="${escapeHTML(item.permalink)}" target="_blank" rel="noopener">${escapeHTML(item.excerpt)}</a></p>`).join('')}
+    </article>` : '';
+  $('#engagement-themes').innerHTML = persuasionCard + (themes.length ? themes.map(theme => `
     <article class="learning-card">
       <div class="learning-card-heading"><strong>${escapeHTML(theme.title)}</strong>${statusChip(theme.kind)}</div>
       <p>${escapeHTML(theme.summary)}</p>
       <div class="learning-meta"><span>${escapeHTML(String(theme.count || 0))} comments</span></div>
-    </article>`).join('') : empty(fallback ? 'Themes need a working AI text provider.' : 'No recurring themes yet.');
+    </article>`).join('') : empty(fallback ? 'Themes need a working AI text provider.' : 'No recurring themes yet.'));
 
   const commentsById = new Map((detail.comments || []).map(comment => [comment.commentId, comment]));
   const postingEnabled = ui.state?.engagement?.postingEnabled === true;
@@ -648,6 +666,7 @@ function retentionChart(snapshot = {}) {
     <title id="retention-chart-title">Audience retention for ${escapeHTML(snapshot.title || snapshot.videoId)}</title>
     <desc id="retention-chart-desc">A ${points.length}-point audience retention curve divided by ${snapshot.sceneMetrics?.length || 0} production scenes.</desc>
     ${sceneBands}${grid}
+    ${snapshot.summary?.turn ? `<g><line x1="${x(snapshot.summary.turn.seconds / duration).toFixed(1)}" y1="${top}" x2="${x(snapshot.summary.turn.seconds / duration).toFixed(1)}" y2="${top + plotHeight}" class="retention-turn"/><text x="${(x(snapshot.summary.turn.seconds / duration) + 4).toFixed(1)}" y="${top + 12}" text-anchor="start">Turn</text><title>Turn to the critique: ${escapeHTML(String(snapshot.summary.turn.kept ?? '?'))}% of the audience kept</title></g>` : ''}
     <polyline points="${line}" class="retention-line"/>
     <text x="${left}" y="${height - 10}" text-anchor="start">Start</text>
     <text x="${width - right}" y="${height - 10}" text-anchor="end">End</text>
@@ -946,13 +965,25 @@ function renderSceneEditor(item, canReview = true) {
   </section>`;
 }
 
+// What the montage says, cut by cut, and how the critic judged it.
+function renderShortMontage(clip) {
+  const segments = clip.segments || [];
+  const critic = clip.critic || {};
+  if (!segments.length && !critic.scores) return '';
+  const scores = critic.scores ? Object.entries(critic.scores).map(([key, value]) => `${escapeHTML(key)} ${escapeHTML(value)}`).join(' · ') : '';
+  return `<details class="short-montage"><summary>Montage · ${segments.length} cut${segments.length === 1 ? '' : 's'}${scores ? ` · critic: ${scores}` : ''}</summary>
+    <ol>${segments.map(segment => `<li>${escapeHTML(segment.text || '')}</li>`).join('')}${clip.cta?.text ? `<li><em>${escapeHTML(clip.cta.text)}</em></li>` : ''}</ol>
+    ${critic.reason ? `<p>${escapeHTML(critic.reason)}</p>` : ''}
+  </details>`;
+}
+
 function renderShortsStudio(item) {
   if (!item.assets?.finalVideo?.path || item.assets.finalVideo.simulated) return '';
   const clips = item.shorts || [];
   const parentApproved = item.review_status === 'approved';
   return `<section class="shorts-studio">
     <div class="panel-heading shorts-heading">
-      <div><p class="eyebrow">SHORTS REPURPOSING STUDIO</p><h3>Turn one production into vertical reach</h3><p>Create local 9:16 excerpts with mobile captions. Drafts inherit the source production's evidence and still require separate approval.</p></div>
+      <div><p class="eyebrow">SHORTS REPURPOSING STUDIO</p><h3>Turn one production into vertical reach</h3><p>Montages of the strongest sentences, judged by an independent critic and closed on the subscribe line. Drafts inherit the source production's evidence and still require separate approval.</p></div>
       <button type="button" class="button secondary small" data-propose-shorts="${escapeHTML(item.id)}">${clips.length ? 'Refresh drafts' : 'Create 3 Short drafts'}</button>
     </div>
     <div class="shorts-evidence ${parentApproved ? 'ready' : ''}">
@@ -973,12 +1004,14 @@ function renderShortsStudio(item) {
           <label><span>Description and parent-video CTA</span><textarea data-short-field="description" rows="3" maxlength="5000" ${locked ? 'disabled' : ''}>${escapeHTML(clip.description)}</textarea></label>
           <label><span>Tags</span><input data-short-field="tags" value="${escapeHTML((clip.tags || []).join(', '))}" ${locked ? 'disabled' : ''}></label>
           <div class="form-grid two">
-            <label><span>Vertical layout</span><select data-short-field="layout" ${locked ? 'disabled' : ''}><option value="blur" ${clip.layout === 'blur' ? 'selected' : ''}>Blurred canvas</option><option value="crop" ${clip.layout === 'crop' ? 'selected' : ''}>Center crop</option><option value="stacked" ${clip.layout === 'stacked' ? 'selected' : ''}>Stacked focus</option></select></label>
+            <label><span>Vertical layout</span><select data-short-field="layout" ${locked ? 'disabled' : ''}><option value="native" ${clip.layout === 'native' ? 'selected' : ''}>Native vertical</option><option value="blur" ${clip.layout === 'blur' ? 'selected' : ''}>Blurred canvas</option><option value="crop" ${clip.layout === 'crop' ? 'selected' : ''}>Center crop</option><option value="stacked" ${clip.layout === 'stacked' ? 'selected' : ''}>Stacked focus</option></select></label>
             <label><span>Publish time</span><input data-short-field="publishTime" type="datetime-local" value="${toLocalInput(clip.publishTime)}" ${locked ? 'disabled' : ''}></label>
             <label><span>Privacy</span><select data-short-field="privacyStatus" ${locked ? 'disabled' : ''}><option value="private" ${clip.privacyStatus === 'private' ? 'selected' : ''}>Private</option><option value="unlisted" ${clip.privacyStatus === 'unlisted' ? 'selected' : ''}>Unlisted</option><option value="public" ${clip.privacyStatus === 'public' ? 'selected' : ''}>Public</option></select></label>
           </div>
           <p class="short-rationale">${escapeHTML(clip.rationale || '')}${clip.error ? `<br><span class="danger-text">${escapeHTML(clip.error)}</span>` : ''}</p>
+          ${renderShortMontage(clip)}
           ${clip.youtubeUrl ? `<a class="source-link" href="${escapeHTML(clip.youtubeUrl)}" target="_blank" rel="noopener">Open published Short ↗</a>` : ''}
+          ${(clip.socialPosts || []).map(post => `<div class="scene-status-row">${escapeHTML(label(post.platform))} ${statusChip(post.status)}${post.url ? ` <a class="source-link" href="${escapeHTML(post.url)}" target="_blank" rel="noopener">Open ↗</a>` : ''}${post.error ? ` <span class="danger-text">${escapeHTML(post.error)}</span>` : ''}</div>`).join('')}
           ${!locked ? `<div class="short-actions"><button type="button" class="text-button" data-short-save>Save draft</button><button type="button" class="button secondary small" data-short-render>${rendered ? 'Render again' : 'Render 9:16'}</button><button type="button" class="button primary small" data-short-approve ${!parentApproved || clip.status !== 'rendered' ? 'disabled' : ''} title="${!parentApproved ? 'Approve the source production first' : clip.status !== 'rendered' ? 'Render this Short first' : 'Confirm and schedule this Short'}">Approve &amp; schedule</button></div>` : ''}
         </div>
       </article>`;

@@ -4,6 +4,9 @@ const path = require('path');
 const sharp = require('sharp');
 const { getMediaDuration, runFFmpeg } = require('./ffmpeg');
 const { ProvenanceService } = require('./provenance-service');
+const { srtFromScenes } = require('./narration-timing');
+const { renderShort, isVertical } = require('./vertical-short');
+const { registerOf, isOpening } = require('./content-mode');
 
 const VIDEO_EXTENSIONS = new Set(['.mp4']);
 const IMAGE_EXTENSIONS = new Set(['.png', '.jpg', '.jpeg', '.webp']);
@@ -16,13 +19,18 @@ function textFromSection(section = {}) {
   return '';
 }
 
+// register: "opening" for the first part of a two-part video (react profile), "main" from the turn onwards and for
+// every other video.
 function scriptScenes(script = {}) {
   const scenes = [];
+  const sections = script.mainContent?.sections || [];
+  const opening = sections.some(section => isOpening(section.register)) ? 'opening' : 'main';
   if (script.hook?.text || script.title) {
     scenes.push({
       label: 'Hook',
+      register: opening,
       scriptText: script.hook?.text || script.title,
-      prompt: `${script.hook?.text || script.title}. Cinematic opening shot, clear subject, intentional camera movement, no captions or on-screen text.`
+      prompt: script.hookImagePrompt || `${script.hook?.text || script.title}. Cinematic opening shot, clear subject, intentional camera movement, no captions or on-screen text.`
     });
   }
   if (script.introduction) {
@@ -33,22 +41,23 @@ function scriptScenes(script = {}) {
       script.introduction.credibility
     ].filter(Boolean).join(' ');
     if (scriptText) scenes.push({
-      label: 'Introduction', scriptText,
+      label: 'Introduction', register: opening, scriptText,
       prompt: `${scriptText}. Establishing visual, clear subject, coherent lighting, no captions or on-screen text.`
     });
   }
-  for (const [index, section] of (script.mainContent?.sections || []).entries()) {
+  for (const [index, section] of sections.entries()) {
     const scriptText = textFromSection(section);
     scenes.push({
       label: section.title || `Scene ${index + 1}`,
+      register: registerOf(section.register),
       scriptText,
-      prompt: `${section.title || ''}. ${scriptText}`.trim() + '. Cinematic explanatory B-roll, natural motion, coherent lighting, no captions or on-screen text.'
+      prompt: section.imagePrompt || (`${section.title || ''}. ${scriptText}`.trim() + '. Cinematic explanatory B-roll, natural motion, coherent lighting, no captions or on-screen text.')
     });
   }
   if (script.conclusion) {
     const scriptText = [...(script.conclusion.recap || []), script.conclusion.finalThought].filter(Boolean).join(' ');
     if (scriptText) scenes.push({
-      label: 'Conclusion', scriptText,
+      label: 'Conclusion', register: 'main', scriptText,
       prompt: `${scriptText}. Memorable cinematic closing shot, no captions or on-screen text.`
     });
   }
@@ -56,9 +65,12 @@ function scriptScenes(script = {}) {
     const cta = script.callToAction;
     const scriptText = [cta.subscribe, cta.like, cta.comment, cta.nextVideo]
       .filter(value => typeof value === 'string').join(' ');
+    // The spoken sentence stays out of the image prompt: an image model given a sentence tries to write it, and
+    // misspells it. Illustrated videos reuse the previous scene's illustration for this short closing scene.
     if (scriptText) scenes.push({
-      label: 'Call to action', scriptText,
-      prompt: `${scriptText}. Clean closing visual with open composition, no captions or on-screen text.`
+      label: 'Call to action', register: 'main', scriptText,
+      prompt: 'Clean closing visual with open composition, no captions or on-screen text.',
+      illustration: 'previous'
     });
   }
   return scenes.length ? scenes : [{ label: script.title || 'Video', scriptText: script.fullScript || '', prompt: script.title || 'Video scene' }];
@@ -114,7 +126,7 @@ function buildInitialSceneManifest(production = {}, providerResult = {}) {
       locked: false,
       rightsConfirmed: true,
       provenanceSourceIds: [],
-      containsSyntheticMedia: Boolean(generatedScene?.path && !['slideshow', 'simulation'].includes(provider)),
+      containsSyntheticMedia: Boolean(generatedScene?.path && !['slideshow', 'simulation', 'visualizer'].includes(provider)),
       estimatedCost: generatedScene?.path ? { unit: 'generated_seconds', amount: generatedScene.duration || 0, pricing: 'provider-priced' } : {},
       actualCost: {}
     };
@@ -155,6 +167,34 @@ class SceneRepairService {
         scene.narrationError = audio.intentionalSilence === true ? null : audio.error || 'Narration audio is unavailable';
       }
       return scenes;
+    }
+    const segments = Array.isArray(audio.segments) ? audio.segments : [];
+    if (segments.length === scenes.length && segments.every(segment => segment?.path)) {
+      // Narration was produced scene by scene: each scene owns an exactly aligned segment.
+      for (const [index, scene] of scenes.entries()) {
+        const segment = segments[index];
+        scene.audioPath = segment.path;
+        scene.duration = Math.max(2, Number(segment.duration) || scene.duration);
+        scene.narrationStatus = 'current';
+        scene.narrationProvider = audio.provider || null;
+        scene.narrationModel = audio.model || null;
+        scene.narrationTaskId = audio.externalTaskId || null;
+        scene.narrationError = null;
+        scene.narrationGeneratedAt = audio.generatedAt || null;
+        scene.narrationCost = audio.cost || {};
+      }
+      return scenes;
+    }
+    // Legacy path: cut the master track. Rescale the estimated scene durations to the measured
+    // master length so no scene ends up past the end of the audio.
+    try {
+      const masterSeconds = Number(await this.getMediaDuration(audioPath));
+      const estimated = scenes.reduce((sum, scene) => sum + Number(scene.duration || 0), 0);
+      if (Number.isFinite(masterSeconds) && masterSeconds > 0 && estimated > 0) {
+        for (const scene of scenes) scene.duration = Math.max(2, Number(((scene.duration / estimated) * masterSeconds).toFixed(2)));
+      }
+    } catch (error) {
+      this.logger.warn(`Could not measure master narration; keeping estimated scene durations: ${error.message}`);
     }
     const directory = path.join(this.dataRoot, 'audio', 'scenes', production.id);
     await fs.mkdir(directory, { recursive: true });
@@ -527,6 +567,11 @@ class SceneRepairService {
     }
   }
 
+  // Injectable for tests.
+  renderShort(...args) {
+    return renderShort(...args);
+  }
+
   async rebuild(productionId) {
     const bundle = await this.getEditableBundle(productionId);
     const scenes = await this.db.listProductionScenes(productionId);
@@ -565,7 +610,7 @@ class SceneRepairService {
     const allIntentionalSilence = scenes.every(scene => scene.narrationStatus === 'intentional_silence');
     await this.videoGenerator.addAudioToVideo(visualPath, audioPath, finalPath, { allowSilent: allIntentionalSilence });
     await fs.unlink(visualPath).catch(() => {});
-    await fs.writeFile(captionsPath, this.buildSRT(scenes));
+    await fs.writeFile(captionsPath, await srtFromScenes(scenes));
     const stats = await fs.stat(finalPath);
     const previousPath = bundle.assets?.finalVideo?.path || null;
     const containsSyntheticMedia = scenes.some(scene => scene.containsSyntheticMedia);
@@ -592,6 +637,17 @@ class SceneRepairService {
       },
       sceneManifest: { count: scenes.length, version: 1, updatedAt: new Date().toISOString() }
     };
+    // A Short stays a Short: the repaired scenes are laid out vertically again, the 16:9 rebuild kept aside.
+    if (isVertical(bundle.assets?.finalVideo)) {
+      const { captionsPath: shortCaptions, ...vertical } = await this.renderShort(
+        { id: productionId, strategy: bundle.strategy, script: bundle.script, assets },
+        scenes,
+        { db: this.db, directory: path.join(this.dataRoot, 'videos'), suffix: `_repair_${timestamp}` }
+      );
+      assets.landscapeVideo = { ...assets.finalVideo, aspectRatio: '16:9', resolution: '1920x1080' };
+      assets.finalVideo = { ...assets.finalVideo, ...vertical, previousPath, fileSize: (await fs.stat(vertical.path)).size };
+      if (shortCaptions) assets.captions = { ...assets.captions, path: shortCaptions };
+    }
     const timeline = { ...bundle.timeline, sceneRepairAt: new Date().toISOString(), captionsGenerated: new Date().toISOString(), readyForUpload: new Date().toISOString() };
     await this.db.updateProductionData({
       id: productionId, status: 'ready', assets, timeline,
@@ -627,33 +683,6 @@ class SceneRepairService {
     args.push('-filter_complex', filters.join(';'), '-map', '[aout]', '-c:a', 'aac', outputPath);
     await runFFmpeg(args);
     return outputPath;
-  }
-
-  buildSRT(scenes) {
-    const time = seconds => {
-      const ms = Math.max(0, Math.round(seconds * 1000));
-      const hours = Math.floor(ms / 3600000);
-      const minutes = Math.floor((ms % 3600000) / 60000);
-      const secs = Math.floor((ms % 60000) / 1000);
-      const millis = ms % 1000;
-      return `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}:${String(secs).padStart(2, '0')},${String(millis).padStart(3, '0')}`;
-    };
-    let cursor = 0;
-    let index = 1;
-    const blocks = [];
-    for (const scene of scenes) {
-      const words = scene.scriptText.trim().split(/\s+/).filter(Boolean);
-      const groups = [];
-      for (let offset = 0; offset < words.length; offset += 8) groups.push(words.slice(offset, offset + 8).join(' '));
-      const duration = Number(scene.duration);
-      const perGroup = groups.length ? duration / groups.length : duration;
-      for (const group of groups) {
-        blocks.push(`${index++}\n${time(cursor)} --> ${time(cursor + perGroup)}\n${group}`);
-        cursor += perGroup;
-      }
-      if (!groups.length) cursor += duration;
-    }
-    return blocks.join('\n\n') + (blocks.length ? '\n' : '');
   }
 
   decorateScene(scene, productionId) {

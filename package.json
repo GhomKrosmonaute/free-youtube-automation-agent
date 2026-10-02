@@ -4,7 +4,8 @@
   "description": "Lumen is an open-source AI agent that runs a YouTube channel end to end",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js",
+    "start": "node scripts/auto.js --autonome",
+    "server": "node index.js",
     "setup": "node setup.js",
     "walkthrough": "node walkthrough.js",
     "growth:snapshot": "node scripts/growth/snapshot-github.js",
@@ -18,9 +19,19 @@
     "agent:publishing": "node agents/publishing-scheduling-agent.js",
     "agent:analytics": "node agents/analytics-optimization-agent.js",
     "credentials:setup": "node utils/credential-manager.js setup",
-    "lint": "eslint ."
+    "lint": "eslint .",
+    "auto": "node scripts/auto.js",
+    "status": "node scripts/auto.js --status",
+    "expert": "node scripts/expert-review.js",
+    "ai-usage": "node scripts/ai-usage.js",
+    "site": "node scripts/site.js",
+    "errata": "node scripts/errata.js",
+    "gaps": "node scripts/gaps.js",
+    "reactive": "node scripts/reactive.js",
+    "voices": "node scripts/tts/voices.js"
   },
   "dependencies": {
+    "@anthropic-ai/sdk": "^0.128.0",
     "@google-cloud/local-auth": "^3.0.0",
     "@google/genai": "^2.9.0",
     "axios": "^1.7.0",

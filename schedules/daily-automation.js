@@ -11,8 +11,20 @@ class DailyAutomation {
     this.healthCheckInterval = null;
     this.lastHealthCheck = null;
     this.generateContent = options.generateContent || null;
+    this.startAutonomousRun = options.startAutonomousRun || null;
+    this.autoShorts = options.autoShorts || null;
+    this.measureShorts = options.measureShorts || null;
     this.engagement = options.engagement || null;
     this.experiments = options.experiments || null;
+    this.social = options.social || null;
+    this.expertReviews = options.expertReviews || null;
+    this.updateSite = options.updateSite || null;
+    this.refreshGaps = options.refreshGaps || null;
+    this.reactive = options.runReactive || null;
+    this.pollReactive = options.pollReactive || null;
+    this.resumeInterrupted = options.resumeInterrupted || null;
+    this.discoverChannels = options.discoverChannels || null;
+    this.refreshWatchScores = options.refreshWatchScores || null;
   }
 
   async initialize() {
@@ -100,6 +112,83 @@ class DailyAutomation {
       }, { scheduled: false })
     );
 
+    // Continuous autonomous production: start a new operator run whenever the previous one is done,
+    // bounded by max_daily_posts. Enabled with the continuous_operator setting. Scripts decided by an expert
+    // go first: their job resumes before a new run takes the generation slot.
+    this.scheduledTasks.set('continuous-operator',
+      cron.schedule('*/10 * * * *', async () => {
+        if (this.isEnabled) {
+          await this.runExpertReviews();
+          await this.runReactive();
+          await this.runInterrupted();
+          await this.runContinuousOperator();
+        }
+        // An erratum added from the terminal asks for the public site to be rebuilt.
+        if (this.updateSite && await this.db.getSetting('site_rebuild_needed') === 'true') await this.updateSite();
+      }, { scheduled: false })
+    );
+    // React mode: the watched channels' feeds every five minutes, so an answer can be out within the hour.
+    this.scheduledTasks.set('reactive-watch',
+      cron.schedule('*/5 * * * *', async () => {
+        if (!this.isEnabled || !this.pollReactive) return;
+        try {
+          await this.pollReactive();
+        } catch (error) {
+          this.logger.error('Reactive watch failed:', error);
+        }
+      }, { scheduled: false })
+    );
+    // The watch list: scores from the audience's reaction to the answers every night, new channels found by web search
+    // every Sunday (the weakest automatic ones make room when the 20 places are taken).
+    this.scheduledTasks.set('watch-scores',
+      cron.schedule('50 4 * * *', async () => {
+        if (!this.isEnabled || !this.refreshWatchScores) return;
+        try {
+          await this.refreshWatchScores();
+        } catch (error) {
+          this.logger.error('Watch list scoring failed:', error);
+        }
+      }, { scheduled: false })
+    );
+    this.scheduledTasks.set('channel-discovery',
+      cron.schedule('30 3 * * 0', async () => {
+        if (!this.isEnabled || !this.discoverChannels) return;
+        try {
+          await this.discoverChannels();
+        } catch (error) {
+          this.logger.error('Channel discovery failed:', error);
+        }
+      }, { scheduled: false })
+    );
+    // Topic gaps measured before the 06:00 planning, within the daily YouTube search budget.
+    this.scheduledTasks.set('topic-gaps',
+      cron.schedule('30 5 * * *', async () => {
+        if (!this.isEnabled || !this.refreshGaps) return;
+        try {
+          await this.refreshGaps();
+        } catch (error) {
+          this.logger.error('Topic gap measurement failed:', error);
+        }
+      }, { scheduled: false })
+    );
+    // The public verification site, rebuilt every night even without a publication (corrections, reviews).
+    this.scheduledTasks.set('verification-site',
+      cron.schedule('45 4 * * *', async () => {
+        if (this.updateSite) await this.updateSite();
+      }, { scheduled: false })
+    );
+    // Shorts for every published video, twice per hour.
+    this.scheduledTasks.set('auto-shorts',
+      cron.schedule('7,37 * * * *', async () => {
+        if (this.isEnabled && this.autoShorts) {
+          try {
+            await this.autoShorts();
+          } catch (error) {
+            this.logger.error('Automatic Shorts failed:', error);
+          }
+        }
+      }, { scheduled: false })
+    );
     // Start all scheduled tasks
     this.scheduledTasks.forEach((task, name) => {
       task.start();
@@ -237,6 +326,76 @@ class DailyAutomation {
     return true;
   }
 
+  // Resends expert-review alerts that never reached the webhook and resumes the jobs an expert has decided.
+  // A video already started and interrupted (a restart, a crash) is resumed before the operator plans a new one.
+  async runInterrupted() {
+    if (!this.resumeInterrupted) return;
+    try {
+      await this.resumeInterrupted();
+    } catch (error) {
+      this.logger.error('Resuming an interrupted job failed:', error);
+    }
+  }
+
+  // A reactive video takes the generation slot before the operator plans a new run.
+  async runReactive() {
+    if (!this.reactive) return;
+    try {
+      await this.reactive();
+    } catch (error) {
+      this.logger.error('Reactive video start failed:', error);
+    }
+  }
+
+  async runExpertReviews() {
+    if (!this.expertReviews) return;
+    try {
+      await this.expertReviews();
+    } catch (error) {
+      this.logger.error('Expert review follow-up failed:', error);
+    }
+  }
+
+  async runContinuousOperator() {
+    // The startup check and a cron tick can overlap, and both would see no active run yet.
+    if (!this.continuousOperatorCheck) {
+      this.continuousOperatorCheck = this.startContinuousRunIfDue()
+        .finally(() => { this.continuousOperatorCheck = null; });
+    }
+    return this.continuousOperatorCheck;
+  }
+
+  async startContinuousRunIfDue() {
+    try {
+      if (!this.startAutonomousRun) return;
+      if (await this.db.getSetting('continuous_operator') !== 'true') return;
+      if (await this.db.getSetting('automation_paused') === 'true') return;
+      const strategy = this.db.getChannelStrategy ? await this.db.getChannelStrategy() : null;
+      if (strategy?.status !== 'active') return;
+      const maxDaily = Number(await this.db.getSetting('max_daily_posts') || 1);
+      // Only count runs started since continuous mode was switched on (and within the last 24 h).
+      const since = await this.db.getSetting('continuous_operator_since');
+      const today = await this.db.getRow(
+        `SELECT COUNT(*) AS count FROM generation_jobs
+         WHERE source = 'autonomous_operator' AND status IN ('completed', 'running', 'queued', 'failed')
+         AND created_at >= datetime('now', '-24 hours')
+         AND (? IS NULL OR created_at >= datetime(?))`,
+        [since || null, since || null]
+      );
+      if (Number(today?.count || 0) >= maxDaily) return;
+      const active = await this.db.getActiveOperatorRun?.();
+      if (active) return;
+      const run = await this.startAutonomousRun();
+      if (run) {
+        this.logger.info(`Continuous operator started run ${run.id} (${Number(today?.count || 0) + 1}/${maxDaily} today)`);
+        await this.logAutomationEvent('continuous_operator', 'started', { runId: run.id });
+      }
+    } catch (error) {
+      this.logger.error('Continuous operator failed to start a run:', error);
+      await this.logAutomationEvent('continuous_operator', 'error', { error: error.message });
+    }
+  }
+
   async processPublishQueue() {
     try {
       const published = await this.agents.publishing.processPublishQueue();
@@ -255,6 +414,21 @@ class DailyAutomation {
         error: error.message
       });
       await this.sendFailureNotification('Publishing Queue', error);
+    }
+    await this.processSocialQueue();
+  }
+
+  // TikTok and Instagram copies of the Shorts, due at the same time as their YouTube upload.
+  async processSocialQueue() {
+    if (!this.social) return;
+    try {
+      const summary = await this.social.processQueue();
+      if (summary.published || summary.drafts || summary.failed || summary.reconciliation) {
+        await this.logAutomationEvent('social_queue_processing', 'success', summary);
+      }
+    } catch (error) {
+      this.logger.error('Failed to process the TikTok/Instagram queue:', error);
+      await this.logAutomationEvent('social_queue_processing', 'error', { error: error.message });
     }
   }
 
@@ -284,6 +458,16 @@ class DailyAutomation {
       }
 
       this.logger.success(`Analytics collection completed. Processed ${processedCount} videos`);
+
+      // Shorts retention calibrates the Shorts editor (ShortsRepurposingService.calibration).
+      if (this.measureShorts) {
+        try {
+          const measured = await this.measureShorts();
+          if (measured) this.logger.info(`Measured the retention of ${measured} Short(s)`);
+        } catch (error) {
+          this.logger.warn(`Shorts retention not measured: ${error.message}`);
+        }
+      }
       
       await this.logAutomationEvent('analytics_collection', 'success', {
         videosProcessed: processedCount

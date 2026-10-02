@@ -124,7 +124,7 @@ class AutonomousChannelOperator {
           let job = record.jobId ? await this.db.getGenerationJob(record.jobId) : null;
           if (job && ['failed', 'interrupted'].includes(job.status)) {
             job = await this.resumeGenerationJob(job.id);
-          } else if (!job || !['queued', 'running', 'completed'].includes(job.status)) {
+          } else if (!job || !['queued', 'running', 'completed', 'waiting_expert', 'rejected'].includes(job.status)) {
             const selectedSourceUrls = new Set(item.sourceUrls || []);
             job = await this.startGenerationJob({
               topic: item.topic,
@@ -139,7 +139,12 @@ class AutonomousChannelOperator {
                 objective: strategy.objective,
                 valueProposition: strategy.value_proposition,
                 constraints: strategy.constraints,
-                researchSources: (research.sourceCatalog || []).filter(source => selectedSourceUrls.has(source.url))
+                researchSources: (research.sourceCatalog || []).filter(source => selectedSourceUrls.has(source.url)),
+                // Where the subject comes from (a measured gap, the lesson cadence) and what it teaches.
+                ...(item.technique ? { technique: item.technique } : {}),
+                ...(item.gapId ? { gapId: item.gapId } : {}),
+                ...(item.claim ? { claim: item.claim } : {}),
+                origin: item.origin || 'planned'
               }
             });
           }
@@ -149,10 +154,11 @@ class AutonomousChannelOperator {
           const completed = job.status === 'completed' ? job : await this.waitForGenerationJob(job.id);
           record.status = completed.status;
           record.productionId = completed.production_id || null;
-          record.reviewStatus = completed.details?.reviewStatus || null;
+          // A script held for an expert finishes production on its own once the expert decides.
+          record.reviewStatus = completed.status === 'waiting_expert' ? 'waiting_expert' : completed.details?.reviewStatus || null;
           record.error = completed.error || null;
           if (ideaId) await this.db.updateContentIdea(ideaId, {
-            status: completed.status === 'completed' ? 'generated' : 'failed'
+            status: completed.status === 'completed' ? 'generated' : completed.status === 'waiting_expert' ? 'waiting_expert' : 'failed'
           });
         } catch (error) {
           record.status = error.code === 'OPERATOR_CANCELLED' ? 'cancelled' : 'failed';
@@ -168,18 +174,21 @@ class AutonomousChannelOperator {
 
       const completed = generatedJobs.filter(job => job.status === 'completed');
       const needsReview = completed.filter(job => ['needs_review', 'needs_attention'].includes(job.reviewStatus));
-      const failed = generatedJobs.filter(job => job.status !== 'completed');
-      const allFailed = completed.length === 0 && failed.length > 0;
-      const status = allFailed ? 'failed' : needsReview.length ? 'waiting_review' : failed.length ? 'completed_with_issues' : 'completed';
+      const waitingExpert = generatedJobs.filter(job => job.status === 'waiting_expert');
+      const failed = generatedJobs.filter(job => !['completed', 'waiting_expert'].includes(job.status));
+      const allFailed = completed.length === 0 && waitingExpert.length === 0 && failed.length > 0;
+      const waiting = needsReview.length + waitingExpert.length;
+      const status = allFailed ? 'failed' : waiting ? 'waiting_review' : failed.length ? 'completed_with_issues' : 'completed';
       const summary = {
         planned: plan.length,
         generated: completed.length,
         needsReview: needsReview.length,
+        waitingExpert: waitingExpert.length,
         failed: failed.length
       };
       await this.update(runId, {
         status,
-        stage: allFailed ? 'failed' : needsReview.length ? 'waiting_for_review' : 'complete',
+        stage: allFailed ? 'failed' : waiting ? 'waiting_for_review' : 'complete',
         progress: 100,
         generatedJobs,
         summary,
@@ -189,8 +198,8 @@ class AutonomousChannelOperator {
       await this.notify({
         type: 'autonomous_run_complete',
         level: failed.length ? 'warning' : 'success',
-        title: needsReview.length ? 'Autonomous plan is ready for review' : 'Autonomous plan completed',
-        message: `${completed.length} of ${plan.length} planned videos finished production.`,
+        title: waitingExpert.length ? 'Autonomous plan is waiting for an expert' : needsReview.length ? 'Autonomous plan is ready for review' : 'Autonomous plan completed',
+        message: `${completed.length} of ${plan.length} planned videos finished production${waitingExpert.length ? `; ${waitingExpert.length} wait for an expert review of their script` : ''}.`,
         data: { runId, ...summary }
       });
     } catch (error) {

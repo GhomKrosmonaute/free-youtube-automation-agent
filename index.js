@@ -1,6 +1,7 @@
 require('dotenv').config();
 
 const express = require('express');
+const autoFactChecker = require('./utils/auto-fact-checker');
 const path = require('path');
 const fs = require('fs').promises;
 const { Logger } = require('./utils/logger');
@@ -23,10 +24,54 @@ const { GenerationRecoveryService, GENERATION_STAGES } = require('./utils/genera
 const { ProvenanceService } = require('./utils/provenance-service');
 const { SceneRepairService } = require('./utils/scene-repair-service');
 const { ShortsRepurposingService } = require('./utils/shorts-repurposing-service');
+const { SocialPublishingService, createSocialPublishers } = require('./utils/social-publishing-service');
 const { AudienceEngagementService } = require('./utils/audience-engagement-service');
 const { GrowthExperimentService } = require('./utils/growth-experiment-service');
 const { AITextService } = require('./utils/ai-text-service');
 const { DiscoverabilityService } = require('./utils/discoverability-service');
+const { ExpertReviewService } = require('./utils/expert-review-service');
+const aiUsage = require('./utils/ai-usage');
+const { MAX_DESCRIPTION_LENGTH } = require('./utils/youtube-metadata-validator');
+const { chapterSpans, titleChapters, formatChapterBlock, formatTimestamp, replaceChapterBlock, stripTimestamps } = require('./utils/chapters');
+const { subscribeLine } = require('./utils/subscribe-cta');
+const { scriptScenes } = require('./utils/scene-repair-service');
+const { getTechnique } = require('./utils/techniques');
+const { deploySite, siteLink, baseUrl: siteBaseUrl } = require('./utils/claims-site');
+const { TopicGapFinder } = require('./utils/topic-gap-finder');
+const { ReactiveWatch, partPassages } = require('./utils/reactive-watch');
+const { compileSeries, seriesOf, isVertical } = require('./utils/vertical-short');
+const { isReactMode, contentMode } = require('./utils/content-mode');
+const { WatchList } = require('./utils/watch-list');
+const { ChannelDiscovery } = require('./utils/channel-discovery');
+const { mention, allowedMentions, alertWebhookUrl, md } = require('./utils/discord-alert');
+const axios = require('axios');
+
+// Where a video's subject comes from: the regular plan, a measured gap, a reaction, or the lesson cadence.
+const GENERATION_ORIGINS = ['planned', 'gap', 'reactive', 'lesson'];
+
+// The generation context a saved strategy was made with, to generate it again the same way.
+function strategyContextOf(strategy = {}) {
+  const context = {
+    angle: strategy.angle,
+    rationale: strategy.planRationale,
+    pillar: strategy.contentPillar,
+    technique: getTechnique(strategy.technique)?.id,
+    origin: GENERATION_ORIGINS.includes(strategy.origin) ? strategy.origin : undefined,
+    gapId: strategy.gapId,
+    reactiveId: strategy.reactiveId,
+    claim: strategy.examinedClaimHint
+  };
+  const limits = { angle: 500, rationale: 1000, pillar: 100, gapId: 100, reactiveId: 100, claim: 500 };
+  const kept = Object.fromEntries(Object.entries(context)
+    .filter(([, value]) => typeof value === 'string' && value.trim())
+    .map(([key, value]) => [key, limits[key] ? value.trim().slice(0, limits[key]) : value]));
+  // A vertical Short, and its place in a series.
+  if (strategy.format === 'short') {
+    const { part, parts } = seriesOf(strategy);
+    Object.assign(kept, { format: 'short', ...(parts > 1 ? { part, parts } : {}) });
+  }
+  return kept;
+}
 const { version } = require('./package.json');
 const chalk = require('chalk');
 
@@ -48,9 +93,11 @@ class YouTubeAutomationAgent {
     this.provenance = null;
     this.scenes = null;
     this.shorts = null;
+    this.social = null;
     this.engagement = null;
     this.experiments = null;
     this.discoverability = null;
+    this.expertReview = null;
     this.setupRequired = false;
   }
 
@@ -89,6 +136,31 @@ class YouTubeAutomationAgent {
       this.credentials = new CredentialManager();
       const credentialsValid = await this.credentials.validateAll();
       this.readiness = new ProductionReadinessService(this.db, this.credentials);
+      // Subjects where the channel adds something: claims widely defended on YouTube and rarely answered.
+      this.gapFinder = new TopicGapFinder(this.db, {
+        watchList: () => this.watchList,
+        youtube: () => this.credentials.getYouTubeClient(),
+        aiText: new AITextService(this.credentials?.credentials || {}),
+        logger: this.logger
+      });
+      // React mode: the watched channels (at most 20, scored on the audience's reaction to the answers), found every week
+      // by web search when the react profile has discovery categories, and their new videos answered while they circulate.
+      this.watchList = new WatchList(this.db, { logger: this.logger });
+      this.discovery = new ChannelDiscovery(this.db, {
+        youtube: () => this.credentials.getYouTubeClient(),
+        watchList: this.watchList,
+        logger: this.logger
+      });
+      this.reactive = new ReactiveWatch(this.db, {
+        youtube: () => this.credentials.getYouTubeClient(),
+        aiText: new AITextService(this.credentials?.credentials || {}),
+        logger: this.logger
+      });
+      this.expertReview = new ExpertReviewService(this.db, {
+        logger: this.logger,
+        aiTextService: new AITextService(this.credentials?.credentials || {}),
+        resumeJob: (jobId, options) => this.resumeGenerationJob(jobId, options)
+      });
       
       if (!credentialsValid) {
         console.log(chalk.yellow('\n⚠️  Some credentials are missing or invalid.'));
@@ -108,7 +180,15 @@ class YouTubeAutomationAgent {
         this.agents.production?.aiVideoGenerator,
         { logger: this.logger }
       );
-      this.shorts = new ShortsRepurposingService(this.db, this.agents.publishing, { logger: this.logger });
+      this.social = new SocialPublishingService(this.db, {
+        logger: this.logger,
+        publishers: createSocialPublishers(this.credentials, { logger: this.logger })
+      });
+      this.shorts = new ShortsRepurposingService(this.db, this.agents.publishing, {
+        logger: this.logger,
+        aiTextService: new AITextService(this.credentials?.credentials || {}),
+        social: this.social
+      });
       this.engagement = new AudienceEngagementService(
         this.db,
         this.credentials,
@@ -135,8 +215,21 @@ class YouTubeAutomationAgent {
       this.logger.info('Setting up automation scheduler...');
       this.scheduler = new DailyAutomation(this.agents, this.db, {
         generateContent: input => this.queueScheduledContent(input),
+        startAutonomousRun: () => this.startAutonomousRun(),
+        autoShorts: () => this.runAutoShorts(),
+        measureShorts: () => this.shorts?.measurePerformance(this.agents.analytics),
+        expertReviews: () => this.expertReview?.tick(),
+        updateSite: () => this.updateSite(),
+        // Topic gaps, channel discovery and watch scores belong to react mode.
+        refreshGaps: () => (isReactMode() ? this.refreshTopicGaps() : null),
+        runReactive: () => this.runReactive(),
+        resumeInterrupted: () => this.resumeInterruptedJobs(),
+        pollReactive: () => this.pollReactive(),
+        discoverChannels: () => (this.discovery && isReactMode() ? this.discovery.run() : null),
+        refreshWatchScores: () => (isReactMode() ? this.watchList?.refreshScores() : null),
         engagement: this.engagement,
-        experiments: this.experiments
+        experiments: this.experiments,
+        social: this.social
       });
       await this.scheduler.initialize();
 
@@ -146,7 +239,14 @@ class YouTubeAutomationAgent {
       
       this.isInitialized = true;
       this.logger.success('YouTube Automation Agent initialized successfully!');
-      
+
+      // Continuous mode would otherwise wait for the next 10-minute cron tick before its first run. Scripts an expert
+      // approved while the server was down resume first, ahead of a new run.
+      if (this.scheduler.isEnabled) {
+        void this.scheduler.runExpertReviews().then(() => this.scheduler.runReactive())
+          .then(() => this.scheduler.runInterrupted()).then(() => this.scheduler.runContinuousOperator());
+      }
+
       return true;
     } catch (error) {
       this.logger.error('Failed to initialize:', error);
@@ -164,6 +264,7 @@ class YouTubeAutomationAgent {
       publishing: new PublishingSchedulingAgent(this.db, this.credentials),
       analytics: new AnalyticsOptimizationAgent(this.db, this.credentials)
     };
+    this.agents.publishing.onPublished = entry => this.handlePublished(entry);
 
     // Initialize each agent
     for (const [name, agent] of Object.entries(this.agents)) {
@@ -184,7 +285,7 @@ class YouTubeAutomationAgent {
       creds.elevenLabs?.apiKey || process.env.ELEVENLABS_API_KEY ||
       creds.azureSpeech?.subscriptionKey || process.env.AZURE_SPEECH_KEY ||
       hasGemini ||
-      (process.platform === 'darwin' && String(process.env.TTS_PROVIDER || '').toLowerCase() === 'macos_say')
+      ['macos_say', 'kokoro', 'chatterbox'].includes(String(process.env.TTS_PROVIDER || '').toLowerCase())
     );
     const hasFFmpeg = await checkFFmpeg();
     const hasUpload = Boolean(creds.youtube && this.credentials.tokens?.youtube);
@@ -265,6 +366,8 @@ class YouTubeAutomationAgent {
         'list',
         'review',
         'story',
+        // The lesson format belongs to react mode.
+        ...(isReactMode() ? ['lesson'] : []),
         'educational',
         'informative',
         'engaging',
@@ -275,6 +378,9 @@ class YouTubeAutomationAgent {
 
       if (style.length > 50) {
         return { valid: false, status: 400, error: 'style must be 50 characters or less' };
+      }
+      if (style.toLowerCase() === 'lesson' && !isReactMode()) {
+        return { valid: false, status: 400, error: 'The lesson format needs CONTENT_MODE=react' };
       }
 
       value.style = allowedStyles.has(style.toLowerCase()) ? style.toLowerCase() : style || null;
@@ -296,6 +402,35 @@ class YouTubeAutomationAgent {
           return { valid: false, status: 400, error: `strategyContext.${key} must be a string of ${max} characters or less` };
         }
         value.strategyContext[key] = body.strategyContext[key].trim();
+      }
+      // Where the subject comes from and what it teaches, carried to the production (public site, learning loop).
+      const context = body.strategyContext;
+      if (context.technique !== undefined && context.technique !== null) {
+        if (!getTechnique(context.technique)) return { valid: false, status: 400, error: 'strategyContext.technique must be a known technique id' };
+        value.strategyContext.technique = getTechnique(context.technique).id;
+      }
+      if (context.origin !== undefined && context.origin !== null) {
+        if (!GENERATION_ORIGINS.includes(context.origin)) return { valid: false, status: 400, error: `strategyContext.origin must be one of ${GENERATION_ORIGINS.join(', ')}` };
+        value.strategyContext.origin = context.origin;
+      }
+      for (const [key, max] of Object.entries({ gapId: 100, reactiveId: 100, claim: 500 })) {
+        if (context[key] === undefined || context[key] === null) continue;
+        if (typeof context[key] !== 'string' || context[key].length > max) {
+          return { valid: false, status: 400, error: `strategyContext.${key} must be a string of ${max} characters or less` };
+        }
+        value.strategyContext[key] = context[key].trim();
+      }
+      // A vertical Short (format "short"), part `part` of `parts` of a series.
+      if (context.format !== undefined && context.format !== null) {
+        if (context.format !== 'short') return { valid: false, status: 400, error: 'strategyContext.format must be "short"' };
+        value.strategyContext.format = 'short';
+      }
+      for (const key of ['part', 'parts']) {
+        if (context[key] === undefined || context[key] === null) continue;
+        if (!Number.isInteger(context[key]) || context[key] < 1 || context[key] > 10) {
+          return { valid: false, status: 400, error: `strategyContext.${key} must be an integer from 1 to 10` };
+        }
+        value.strategyContext[key] = context[key];
       }
     }
 
@@ -340,7 +475,8 @@ class YouTubeAutomationAgent {
     }
     if (!['short', 'medium', 'long'].includes(defaultLength)) throw new Error('defaultLength is not supported');
     if (!['draft', 'active', 'paused'].includes(status)) throw new Error('status must be draft, active, or paused');
-    if (!['views', 'watch_hours', 'subscribers', 'engagement', 'revenue'].includes(primaryKpi)) {
+    // Persuasion (the comments' stances, react profile) is measured in react mode only.
+    if (!['views', 'watch_hours', 'subscribers', 'engagement', 'revenue', ...(isReactMode() ? ['persuasion'] : [])].includes(primaryKpi)) {
       throw new Error('primaryKpi is not supported');
     }
     if (!/^[A-Z]{3}$/.test(outcomeCurrency)) throw new Error('outcomeCurrency must be a three-letter currency code');
@@ -517,6 +653,7 @@ class YouTubeAutomationAgent {
           channelStrategy, operatorRuns, readiness, engagement, experiments,
           system: {
             initialized: this.isInitialized,
+            contentMode: contentMode(),
             setupRequired: this.setupRequired,
             uptime: process.uptime(),
             activeJobs: this.activeJobs.size,
@@ -546,6 +683,45 @@ class YouTubeAutomationAgent {
         return res.status(202).json({ success: true, result });
       } catch (error) {
         return res.status(error.status || 400).json({ success: false, error: error.message });
+      }
+    });
+
+    // Scripts on highly specialised subjects held for a human expert (also driven by npm run expert).
+    this.app.get('/api/expert-reviews', async (req, res) => {
+      if (!this.expertReview) return res.status(503).json({ success: false, error: 'Expert review is not initialized' });
+      const status = ['pending', 'approved', 'revision_requested', 'rejected'].includes(req.query.status) ? req.query.status : null;
+      const reviews = await this.db.listExpertReviews({ status, limit: 50 });
+      return res.json({ success: true, result: reviews.map(({ script: _script, ...review }) => review) });
+    });
+
+    this.app.get('/api/expert-reviews/:reviewId', async (req, res) => {
+      if (!this.expertReview) return res.status(503).json({ success: false, error: 'Expert review is not initialized' });
+      const review = await this.db.getExpertReview(req.params.reviewId);
+      if (!review) return res.status(404).json({ success: false, error: 'Expert review not found' });
+      return res.json({ success: true, result: { ...review, markdown: this.expertReview.renderScript(review) } });
+    });
+
+    this.app.post('/api/expert-reviews/:reviewId/decision', protect, async (req, res) => {
+      try {
+        if (!this.expertReview) return res.status(503).json({ success: false, error: 'Expert review is not initialized' });
+        const result = await this.expertReview.decide(req.params.reviewId, {
+          decision: req.body?.decision,
+          notes: req.body?.notes,
+          reviewer: req.body?.reviewer
+        });
+        return res.json({ success: true, result });
+      } catch (error) {
+        return res.status(error.status || 500).json({ success: false, error: error.message });
+      }
+    });
+
+    // Assessed again under the current rules: approved automatically when no passage needs an expert any more.
+    this.app.post('/api/expert-reviews/:reviewId/reassess', protect, async (req, res) => {
+      try {
+        if (!this.expertReview) return res.status(503).json({ success: false, error: 'Expert review is not initialized' });
+        return res.json({ success: true, result: await this.expertReview.reassess(req.params.reviewId, { triage: req.body?.triage === true }) });
+      } catch (error) {
+        return res.status(error.status || 500).json({ success: false, error: error.message });
       }
     });
 
@@ -583,6 +759,10 @@ class YouTubeAutomationAgent {
       if (this.scenes && !bundle.scenes?.length) {
         await this.scenes.ensureManifest(bundle);
         bundle = await this.db.getProductionBundle(req.params.productionId);
+      }
+      // Where each Short also went (TikTok, Instagram Reels).
+      for (const clip of bundle.shorts || []) {
+        clip.socialPosts = this.social ? await this.social.listForClip(clip.id).catch(() => []) : [];
       }
       return res.json(this.decorateContentBundle(bundle));
     });
@@ -672,6 +852,17 @@ class YouTubeAutomationAgent {
         return res.json({ success: true, result });
       } catch (error) {
         return res.status(error.status || 400).json({ success: false, error: error.message, code: error.code });
+      }
+    });
+
+    this.app.get('/api/content/:productionId/shorts/:clipId/social', protect, async (req, res) => {
+      try {
+        const clip = await this.db.getShortClip(req.params.clipId);
+        if (!clip || clip.productionId !== req.params.productionId) return res.status(404).json({ error: 'Short draft not found' });
+        const posts = this.social ? await this.social.listForClip(clip.id) : [];
+        return res.json({ success: true, posts: posts.map(({ metadata, ...post }) => ({ ...post, caption: metadata.caption })) });
+      } catch (error) {
+        return res.status(error.status || 400).json({ success: false, error: error.message });
       }
     });
 
@@ -804,6 +995,8 @@ class YouTubeAutomationAgent {
         reviewedAt: new Date().toISOString()
       });
       await this.db.updateProductionStatus(bundle.id, 'rejected');
+      const reactive = await this.db.findReactiveItem?.({ productionId: bundle.id });
+      if (reactive) await this.db.updateReactiveItem(reactive.id, { status: 'dismissed', error: req.body?.notes || 'Rejected by operator' });
       return res.json({ success: true });
     });
 
@@ -814,6 +1007,8 @@ class YouTubeAutomationAgent {
         topic: bundle.strategy.topic || bundle.editorData.title || null,
         style: bundle.strategy.requestedStyle || bundle.strategy.contentType || null,
         length: bundle.strategy.requestedLengthKey || 'medium',
+        // A retried reactive video stays reactive (and waits for approval), a lesson keeps its technique.
+        strategyContext: strategyContextOf(bundle.strategy),
         source: 'retry'
       });
       return res.status(202).json({ success: true, result: job });
@@ -1270,12 +1465,13 @@ class YouTubeAutomationAgent {
       error.status = 503;
       throw error;
     }
-    if (['scheduler', 'autonomous_operator'].includes(input.source)) {
+    if (['scheduler', 'autonomous_operator', 'reactive'].includes(input.source)) {
       await this.readiness?.assertReady('Automated generation');
     }
     const maxConcurrent = Math.max(1, parseInt(process.env.MAX_CONCURRENT_JOBS || '1', 10));
-    if (this.activeJobs.size >= maxConcurrent) {
-      const error = new Error(`Generation is busy (${this.activeJobs.size}/${maxConcurrent} active jobs). Try again when the current job finishes.`);
+    const starting = this.startingJobs || 0;
+    if (this.activeJobs.size + starting >= maxConcurrent) {
+      const error = new Error(`Generation is busy (${this.activeJobs.size + starting}/${maxConcurrent} active jobs). Try again when the current job finishes.`);
       error.status = 429;
       throw error;
     }
@@ -1287,16 +1483,22 @@ class YouTubeAutomationAgent {
       throw error;
     }
 
-    const job = await this.db.createGenerationJob({
-      ...validation.value,
-      source: input.source || 'manual'
-    });
+    // The slot is taken before the first await: two callers (a reactive video, the operator) cannot both get it.
+    this.startingJobs = starting + 1;
+    try {
+      const job = await this.db.createGenerationJob({
+        ...validation.value,
+        source: input.source || 'manual'
+      });
 
-    const work = this.runGenerationJob(job.id, validation.value)
-      .catch(error => this.logger.error(`Generation job ${job.id} failed:`, error))
-      .finally(() => this.activeJobs.delete(job.id));
-    this.activeJobs.set(job.id, work);
-    return job;
+      const work = this.runGenerationJob(job.id, validation.value)
+        .catch(error => this.logger.error(`Generation job ${job.id} failed:`, error))
+        .finally(() => this.activeJobs.delete(job.id));
+      this.activeJobs.set(job.id, work);
+      return job;
+    } finally {
+      this.startingJobs -= 1;
+    }
   }
 
   async resumeGenerationJob(jobId, options = {}) {
@@ -1311,8 +1513,9 @@ class YouTubeAutomationAgent {
       error.status = 404;
       throw error;
     }
-    if (!['failed', 'interrupted'].includes(job.status)) {
-      const error = new Error('Only failed or interrupted generation jobs can be resumed');
+    // A job waiting for an expert resumes once the review is decided; resumed earlier, it waits again.
+    if (!['failed', 'interrupted', 'waiting_expert'].includes(job.status)) {
+      const error = new Error('Only failed, interrupted or expert-reviewed generation jobs can be resumed');
       error.status = 409;
       throw error;
     }
@@ -1327,7 +1530,7 @@ class YouTubeAutomationAgent {
       error.status = 429;
       throw error;
     }
-    if (['scheduler', 'autonomous_operator'].includes(job.source)) {
+    if (['scheduler', 'autonomous_operator', 'reactive'].includes(job.source)) {
       await this.readiness?.assertReady('Automated generation recovery');
     }
 
@@ -1375,6 +1578,8 @@ class YouTubeAutomationAgent {
   async queueScheduledContent(input = {}) {
     const strategy = await this.db.getChannelStrategy();
     if (strategy?.status === 'active') {
+      // A viral claim waiting for an answer takes the next slot; the planned run comes after it.
+      if (await this.reactiveWaiting()) return null;
       const weeklyOutput = await this.db.getRow(
         `SELECT COUNT(*) AS count FROM generation_jobs
          WHERE source = 'autonomous_operator' AND status = 'completed'
@@ -1392,10 +1597,12 @@ class YouTubeAutomationAgent {
   async runGenerationJob(jobId, input) {
     try {
       await this.db.updateGenerationJob(jobId, { status: 'running', progress: 2, error: null, completedAt: null });
-      const result = await this.generateContent(input.topic, input.style, input.length, {
+      await this.trackSubject(input.strategyContext, 'planned');
+      // Every model call of the video is recorded against its job (npm run ai-usage).
+      const result = await aiUsage.withContext({ jobId }, () => this.generateContent(input.topic, input.style, input.length, {
         jobId,
         strategyContext: input.strategyContext
-      });
+      }));
       await this.db.updateGenerationJob(jobId, {
         status: 'completed',
         stage: result.reviewStatus === 'approved' ? 'scheduled' : result.reviewStatus,
@@ -1406,8 +1613,21 @@ class YouTubeAutomationAgent {
         completedAt: new Date().toISOString()
       });
       await this.db.setSetting('last_content_generation', new Date().toISOString());
+      await this.trackSubject(input.strategyContext, 'covered', result.contentId);
       return result;
     } catch (error) {
+      // Not a failure: the script waits for an expert, who was alerted by the review stage.
+      if (error.code === 'EXPERT_REVIEW_PENDING') {
+        await this.db.updateGenerationJob(jobId, {
+          status: 'waiting_expert',
+          stage: 'expert_review',
+          error: null,
+          details: { expertReviewId: error.reviewId },
+          completedAt: null
+        });
+        this.logger.info(`Generation job ${jobId} is waiting for expert review ${error.reviewId}`);
+        return { held: true, reviewId: error.reviewId };
+      }
       const cancelled = error.code === 'JOB_CANCELLED';
       const current = await this.db.getGenerationJob(jobId);
       const failedStage = current?.stage || 'starting';
@@ -1418,6 +1638,7 @@ class YouTubeAutomationAgent {
         details: { failedStage },
         completedAt: new Date().toISOString()
       });
+      await this.trackSubject(input.strategyContext, 'open');
       await this.operator.notify({
         type: cancelled ? 'generation_cancelled' : 'generation_failure',
         level: cancelled ? 'warning' : 'error',
@@ -1426,6 +1647,288 @@ class YouTubeAutomationAgent {
         data: { jobId }
       });
       throw error;
+    }
+  }
+
+  // Measures new topic gaps for the active channel strategy, within the daily YouTube search budget.
+  async refreshTopicGaps(options = {}) {
+    const strategy = await this.db.getChannelStrategy();
+    if (!this.gapFinder || strategy?.status !== 'active') return { measured: 0, gaps: [] };
+    return this.gapFinder.refresh(strategy, options);
+  }
+
+  // Where the subject came from follows its video: a measured gap is planned while it is made, covered once it is,
+  // and open again if it fails (a video held for an expert stays planned).
+  async trackSubject(context = {}, status, productionId = null) {
+    if (context?.gapId && this.db.updateTopicGap) {
+      await this.db.updateTopicGap(context.gapId, { status, productionId })
+        .catch(error => this.logger.warn(`Topic gap ${context.gapId} could not be updated: ${error.message}`));
+    }
+    // A reactive item: generating, then waiting for the operator's review, or failed. A part of a series that is done
+    // waits for the next part (next_part), which starts once this one is approved.
+    if (context?.reactiveId && this.db.updateReactiveItem) {
+      const { part, parts } = seriesOf(context);
+      const reactive = status === 'covered' && part < parts ? 'next_part' : { planned: 'generating', covered: 'review', open: 'failed' }[status];
+      const item = productionId ? await this.db.getReactiveItem?.(context.reactiveId).catch(() => null) : null;
+      const episodes = item ? (item.episodes || []).map(episode => (episode.part === part ? { ...episode, productionId } : episode)) : undefined;
+      await this.db.updateReactiveItem(context.reactiveId, { status: reactive, ...(productionId ? { productionId } : {}), ...(episodes ? { episodes } : {}) })
+        .catch(error => this.logger.warn(`Reactive item ${context.reactiveId} could not be updated: ${error.message}`));
+    }
+  }
+
+  // Videos already started are never lost: a job interrupted by a restart or a crash is resumed where it stopped, one
+  // at a time when the generation slot is free, before the operator plans anything new. Reactive jobs are resumed by
+  // runReactive; a job already resumed three times is left to the operator.
+  async resumeInterruptedJobs() {
+    if (this.setupRequired || !this.agents.strategy) return null;
+    if (this.activeJobs.size || this.startingJobs || this.autonomous?.activeRuns?.size) return null;
+    const rows = await this.db.getAllRows(
+      "SELECT id, source, details FROM generation_jobs WHERE status = 'interrupted' AND source != 'reactive' ORDER BY created_at ASC"
+    );
+    for (const row of rows) {
+      let details = {};
+      try { details = JSON.parse(row.details || '{}'); } catch (_error) { /* unreadable details: resumed anyway */ }
+      if (Number(details.resumeCount || 0) >= 3) continue;
+      try {
+        const job = await this.resumeGenerationJob(row.id);
+        this.logger.info(`Resumed interrupted job ${row.id}`);
+        return job;
+      } catch (error) {
+        if (error.status === 429) return null;
+        this.logger.warn(`Interrupted job ${row.id} could not be resumed: ${error.message}`);
+      }
+    }
+    return null;
+  }
+
+  async reactiveWaiting() {
+    if (!this.reactive?.enabled?.() || !this.db.listReactiveItems) return false;
+    return (await this.db.listReactiveItems({ status: ['queued', 'next_part'], limit: 1 }).catch(() => [])).length > 0;
+  }
+
+  // Every hour: new videos of the watched channels that spread fast and defend a claim become reactive items.
+  async pollReactive() {
+    const strategy = await this.db.getChannelStrategy();
+    if (!this.reactive?.enabled() || strategy?.status !== 'active') return { created: [] };
+    return this.reactive.poll(strategy);
+  }
+
+  // The 10-minute tick, before the operator: expires stale items, resumes an interrupted reactive job, then starts the
+  // oldest queued item as soon as no job, job start or operator run holds the generation slot.
+  async runReactive() {
+    if (!this.reactive?.enabled() || this.setupRequired || !this.agents.strategy) return null;
+    for (const item of await this.reactive.expire()) {
+      await this.operator.notify({ type: 'reactive_expired', level: 'warning', title: 'Reactive video expired', message: `${item.topic}: no longer an urgent answer`, data: { reactiveId: item.id } });
+    }
+    const busy = async () => this.activeJobs.size || this.startingJobs || this.autonomous?.activeRuns?.size || await this.db.getActiveOperatorRun?.();
+    for (const item of await this.db.listReactiveItems({ status: 'generating' })) {
+      const job = item.jobId ? await this.db.getGenerationJob(item.jobId) : null;
+      if (job?.status === 'interrupted' && !(await busy())) return this.resumeGenerationJob(job.id);
+      if (['failed', 'cancelled'].includes(job?.status)) await this.db.updateReactiveItem(item.id, { status: 'failed', error: job.error || job.status });
+    }
+    // The next part of a series, once the previous one is approved (scheduled or out), so the parts come out in order.
+    for (const item of await this.db.listReactiveItems({ status: 'next_part' })) {
+      const previous = (item.episodes || []).reduce((last, episode) => (!last || episode.part > last.part ? episode : last), null);
+      const entry = previous?.productionId ? await this.db.getLatestScheduleEntry(previous.productionId).catch(() => null) : null;
+      if (!['scheduled', 'publishing', 'published'].includes(entry?.status) || await busy()) continue;
+      return this.startReactivePart(item, previous.part + 1);
+    }
+    const [next] = await this.db.listReactiveItems({ status: 'queued', limit: 1 });
+    if (!next || await busy()) return null;
+    return this.startReactivePart(next, 1);
+  }
+
+  // A reaction is a vertical Short, also posted to TikTok and Instagram Reels; when its arguments do not fit
+  // in one (Jev, utils/reactive-watch.js), it is a series, one part at a time.
+  async startReactivePart(item, part) {
+    const parts = Math.max(1, item.parts || 1);
+    const job = await this.startGenerationJob({
+      topic: item.topic,
+      style: 'explainer',
+      length: 'short',
+      source: 'reactive',
+      strategyContext: {
+        origin: 'reactive',
+        reactiveId: item.id,
+        claim: item.claim,
+        format: 'short',
+        ...(parts > 1 ? { part, parts } : {}),
+        rationale: 'Affirmation qui circule en ce moment : y répondre pendant qu\'elle se diffuse.'
+      }
+    });
+    const episodes = [...(item.episodes || []).filter(episode => episode.part !== part), { part, jobId: job.id }].sort((a, b) => a.part - b.part);
+    await this.db.updateReactiveItem(item.id, { status: 'generating', jobId: job.id, episodes });
+    this.logger.info(`Reactive Short started for « ${item.claim} »${parts > 1 ? ` (part ${part}/${parts})` : ''} (job ${job.id})`);
+    return job;
+  }
+
+  // A video on YouTube gets its page on the public verification site; a Short cut out of a long video does not.
+  // A reaction is published once all its parts are, and a series is then joined into one 16:9 video.
+  async handlePublished(entry) {
+    if (entry.metadata?.shortClipId) return;
+    this.requestSiteUpdate();
+    const reactive = await this.db.findReactiveItem?.({ productionId: entry.productionId });
+    if (!reactive) return;
+    if (entry.metadata?.contentType === 'short') await this.shareShort(entry);
+    if ((await this.publishedParts(reactive)).length < reactive.parts) return;
+    await this.db.updateReactiveItem(reactive.id, { status: 'published' });
+    if (reactive.parts > 1 && !reactive.compilationId) {
+      await this.compileReactiveSeries(reactive.id)
+        .catch(error => this.logger.warn(`The series ${reactive.id} could not be joined into one video: ${error.message.slice(0, 200)}`));
+    }
+  }
+
+  // The parts of an answer already on YouTube, in order.
+  async publishedParts(item) {
+    const published = [];
+    for (const episode of (item.episodes || []).slice().sort((a, b) => a.part - b.part)) {
+      if (!episode.productionId) continue;
+      const entry = await this.db.getLatestScheduleEntry(episode.productionId).catch(() => null);
+      if (entry?.status === 'published') published.push({ ...episode, entry });
+    }
+    return published;
+  }
+
+  // A Short that stands alone also goes to TikTok and Instagram Reels (SOCIAL_PLATFORMS), when they are configured.
+  async shareShort(entry) {
+    if (!this.social || !entry.metadata?.video?.path) return [];
+    const seo = entry.metadata.seo || {};
+    const profile = await this.db.getChannelProfile().catch(() => null);
+    return this.social.enqueueShort({
+      clip: { id: entry.productionId, productionId: entry.productionId, outputPath: entry.metadata.video.path, title: seo.title || entry.title, description: seo.description || '', tags: seo.tags || [] },
+      publishTime: new Date().toISOString(),
+      containsSyntheticMedia: entry.metadata.containsSyntheticMedia === true,
+      profile
+    }).catch(error => {
+      this.logger.warn(`Short ${entry.productionId} not queued for the other platforms: ${error.message.slice(0, 160)}`);
+      return [];
+    });
+  }
+
+  // Once every part of a series is out, the parts are joined end to end into one 16:9 video (each vertical frame over a
+  // blurred copy of itself), chaptered by part, and published like the parts were: they were each approved.
+  async compileReactiveSeries(reactiveId) {
+    const item = await this.db.getReactiveItem(reactiveId);
+    if (!item || item.parts < 2 || item.compilationId) return null;
+    const published = await this.publishedParts(item);
+    if (published.length < item.parts) return null;
+    const bundles = [];
+    for (const episode of published) {
+      const bundle = await this.db.getProductionBundle(episode.productionId);
+      if (!bundle?.assets?.finalVideo?.path) throw new Error(`Part ${episode.part} has no video file`);
+      bundles.push({ bundle, entry: episode.entry, part: episode.part });
+    }
+    const id = `prod_series_${String(item.id).replace(/^reactive_/, '')}`;
+    const video = await compileSeries(
+      bundles.map(({ bundle }) => ({ path: bundle.assets.finalVideo.path, duration: bundle.assets.finalVideo.duration, captionsPath: bundle.assets.captions?.path })),
+      path.join(__dirname, 'data', 'videos', `${id}_final.mp4`)
+    );
+    const partTitle = ({ bundle, entry }) => String(entry.metadata?.seo?.title || bundle.seo?.title || bundle.script?.title || '').trim();
+    const title = (partTitle(bundles[0]).replace(/\s*[(（]\s*partie\s*\d+\s*\/\s*\d+\s*[)）]\s*$/i, '').trim() || item.topic).slice(0, 100);
+    // Chapters: one per part, timed on the parts as they were published.
+    let at = 0;
+    const chapters = [];
+    for (const { bundle, part } of bundles) {
+      const length = Number(bundle.assets.finalVideo.duration) || 0;
+      chapters.push({ start: Math.round(at), end: Math.round(at + length), title: `Partie ${part}` });
+      at += length;
+    }
+    const profile = await this.db.getChannelProfile().catch(() => ({})) || {};
+    const first = bundles[0].bundle;
+    const examined = first.strategy?.examinedVideo;
+    const sources = new Map();
+    for (const { bundle } of bundles) {
+      const provenance = await this.db.getContentProvenance?.(bundle.id).catch(() => null);
+      for (const source of (provenance?.sources || []).filter(entry => entry.status === 'verified')) sources.set(source.url, source);
+    }
+    const description = [
+      `Les ${bundles.length} parties de cette réponse, réunies en une vidéo.`,
+      bundles.map(({ entry, part, ...rest }) => `▶️ Partie ${part} : ${partTitle({ entry, ...rest })} : ${entry.youtubeUrl}`).join('\n'),
+      subscribeLine(profile.call_to_action, await this.youtubeChannelId()),
+      examined?.url ? `📌 Vidéo examinée : « ${examined.title} » (${examined.channel}) : ${examined.url}` : null,
+      this.chapterBlock(chapters) || null,
+      sources.size ? `SOURCES (vérifiées)\n${[...sources.values()].slice(0, 12).map(source => `• ${source.title}${source.publisher ? ` (${source.publisher})` : ''} : ${source.url}`).join('\n')}` : null
+    ].filter(Boolean).join('\n\n').slice(0, 5000);
+    const strategy = { ...first.strategy, format: null, part: null, parts: null, seriesOf: bundles.map(({ bundle }) => bundle.id) };
+    const seo = { ...(first.seo || {}), title, description, chapters, tags: (first.seo?.tags || []).filter(tag => tag !== 'Shorts') };
+    const compilation = {
+      id,
+      status: 'ready',
+      strategy,
+      script: { ...(first.script || {}), title },
+      thumbnail: null,
+      seo,
+      assets: {
+        finalVideo: { path: video.path, format: 'mp4', aspectRatio: video.aspectRatio, resolution: video.resolution, duration: video.duration },
+        audio: { path: video.path, compiled: true },
+        captions: video.captionsPath ? { path: video.captionsPath, format: 'srt', language: process.env.CONTENT_LANGUAGE || 'fr' } : null,
+        thumbnail: null
+      },
+      timeline: { created: new Date().toISOString(), readyForUpload: new Date().toISOString() },
+      scheduledPublishTime: new Date().toISOString(),
+      priority: 'high',
+      estimatedDuration: video.duration,
+      privacyStatus: bundles[0].entry.metadata?.privacyStatus || process.env.DEFAULT_PRIVACY_STATUS || 'private',
+      containsSyntheticMedia: bundles[0].entry.metadata?.containsSyntheticMedia === true,
+      contentType: 'long_form'
+    };
+    await this.db.saveProductionData(compilation);
+    await this.db.saveProductionSnapshot(compilation);
+    await this.db.saveContentReview(id, {
+      status: 'approved',
+      reviewNotes: `Assemblage automatique des ${bundles.length} parties publiées (chacune approuvée)`,
+      reviewedAt: new Date().toISOString()
+    });
+    await this.db.updateReactiveItem(item.id, { compilationId: id });
+    const entry = await this.agents.publishing.scheduleContent(compilation);
+    await this.db.updateProductionStatus(id, entry ? 'scheduled' : 'ready');
+    await this.operator.notify({
+      type: 'reactive_series_compiled', level: 'info', title: 'Series joined into one video',
+      message: `${title}: ${bundles.length} parts, ${Math.round(video.duration)} s`, data: { reactiveId: item.id, contentId: id }
+    });
+    this.logger.info(`Series ${item.id} joined into ${id} (${bundles.length} parts, ${video.duration}s)`);
+    return { id, entry };
+  }
+
+  // The operator decides fast: the claim, how fast the video it answers spreads, and the commands.
+  async alertReactive(strategy, script, contentId, quality, jevApproval = null) {
+    const item = strategy.reactiveId ? await this.db.getReactiveItem(strategy.reactiveId).catch(() => null) : null;
+    const url = alertWebhookUrl();
+    if (!url) {
+      this.logger.warn(`Reactive video ${contentId} is ready for review but no alert webhook is set (EXPERT_REVIEW_WEBHOOK_URL)`);
+      return;
+    }
+    const ping = mention();
+    const source = item?.video || {};
+    const blocking = quality.passed ? null : `⚠️ **Contrôles bloquants** : ${md(quality.blockingFailures.join(', '))}`;
+    const approved = Boolean(jevApproval?.approved);
+    const jevLine = approved
+      ? `✅ **Approuvée par Jev** : faits vérifiés, ton vérifié, ${jevApproval.fidelity.length} citation(s) fidèle(s) (min ${Math.min(...jevApproval.fidelity.map(item => item.probability))})`
+      : jevApproval?.reasons?.length ? `⚠️ **Jev n'a pas approuvé** : ${md(jevApproval.reasons.join(' ; ')).slice(0, 600)}` : null;
+    const lines = [
+      approved ? '## ⚡ Réponse publiée automatiquement' : '## ⚡ Réponse prête à valider',
+      strategy.format === 'short' ? `-# Short${seriesOf(strategy).parts > 1 ? `, partie ${seriesOf(strategy).part}/${seriesOf(strategy).parts} : la suivante est produite une fois celle-ci approuvée` : ''}` : null,
+      `${ping.tags.length ? `${ping.tags.join(' ')} ` : ''}**« ${md(script.title)} »**`,
+      '',
+      `**Affirmation** : ${md(item?.claim || strategy.examinedClaimHint || '')}`,
+      source.url ? `**Vidéo d'origine** : ${md(source.channel || '')}, ${Number(source.views || 0).toLocaleString('fr-FR')} vues (${Number(source.viewsPerHour || 0).toLocaleString('fr-FR')} par heure) : <${source.url}>` : null,
+      blocking,
+      jevLine,
+      '',
+      ...(approved ? [
+        '-# Publication dans le quart d\'heure. Une erreur repérée après coup : `npm run errata -- add <youtubeId> "correction"`.'
+      ] : [
+        '### Décision',
+        `✅ Publier tout de suite : \`npm run reactive -- approve ${contentId}\``,
+        `🗑️ Abandonner : \`npm run reactive -- reject ${contentId}\``,
+        '-# Revue complète dans le tableau de bord.'
+      ])
+    ].filter(line => line !== null);
+    const content = lines.join('\n').slice(0, 1900);
+    try {
+      await axios.post(url, { content, text: content.replace(/\*\*|`|## |### |-# /g, ''), allowed_mentions: allowedMentions(ping), event: approved ? 'reactive_auto_approved' : 'reactive_review_required', contentId }, { timeout: 15000 });
+    } catch (error) {
+      this.logger.warn(`Reactive alert failed for ${contentId}: ${error.message}`);
     }
   }
 
@@ -1450,7 +1953,7 @@ class YouTubeAutomationAgent {
     // Step 1: Strategy
     const strategy = await this.runGenerationStage(jobId, 'strategy', 10, async () => {
       const generated = await this.agents.strategy.generateContentStrategy(topic);
-      const contentStyles = new Set(['tutorial', 'explainer', 'list', 'review', 'story']);
+      const contentStyles = new Set(['tutorial', 'explainer', 'list', 'review', 'story', ...(isReactMode() ? ['lesson'] : [])]);
       const requestedStyle = style || profile.default_style || null;
       if (requestedStyle && contentStyles.has(requestedStyle.toLowerCase())) {
         generated.contentType = requestedStyle.charAt(0).toUpperCase() + requestedStyle.slice(1).toLowerCase();
@@ -1467,6 +1970,28 @@ class YouTubeAutomationAgent {
       generated.channelConstraints = strategyContext.constraints || null;
       generated.contentPillar = strategyContext.pillar || null;
       generated.callToAction = profile.call_to_action || null;
+      generated.origin = strategyContext.origin || 'planned';
+      // A manual lesson (no technique given) teaches the one taught least recently.
+      generated.technique = strategyContext.technique ||
+        (generated.contentType === 'Lesson' ? (await this.agents.strategy.nextTechnique?.())?.id || null : null);
+      generated.gapId = strategyContext.gapId || null;
+      generated.reactiveId = strategyContext.reactiveId || null;
+      // The claim as it was found, since the strategy model may reword the topic.
+      generated.examinedClaimHint = strategyContext.claim || null;
+      // React mode: the video answered, named, linked and quoted word for word (as text, no footage).
+      const reactive = strategyContext.reactiveId ? await this.db.getReactiveItem?.(strategyContext.reactiveId).catch(() => null) : null;
+      // A vertical Short, alone or one part of a series, quoting only its own passages.
+      generated.format = strategyContext.format === 'short' ? 'short' : null;
+      const { part, parts } = seriesOf(strategyContext);
+      if (generated.format) Object.assign(generated, { part, parts });
+      const passages = generated.format ? partPassages(reactive?.passages || [], part, parts) : reactive?.passages || [];
+      generated.examinedVideo = reactive?.video?.url ? {
+        title: reactive.video.title,
+        channel: reactive.video.channel,
+        channelId: reactive.channelId || null,
+        url: reactive.video.url,
+        passages: passages.map(({ text, timestamp }) => ({ text, ...(timestamp ? { timestamp } : {}) }))
+      } : null;
       generated.researchSources = Array.isArray(strategyContext.researchSources)
         ? strategyContext.researchSources
         : [];
@@ -1474,14 +1999,20 @@ class YouTubeAutomationAgent {
     });
     this.logger.info(`Strategy generated: ${strategy.topic}`);
 
-    // Step 2: Script Writing
-    const script = await this.runGenerationStage(
+    // Step 2: Script Writing (with the expert's corrections when the last review asked for some)
+    const expertRevision = jobId && this.expertReview ? await this.expertReview.revisionRequest(jobId) : null;
+    const draft = await this.runGenerationStage(
       jobId,
       'script',
       25,
-      () => this.agents.scriptWriter.generateScript(strategy)
+      () => this.agents.scriptWriter.generateScript(expertRevision ? { ...strategy, expertRevision } : strategy)
     );
-    this.logger.info(`Script generated: ${script.title}`);
+    this.logger.info(`Script generated: ${draft.title}`);
+
+    // Step 2b: Expert review of highly specialised subjects, before any time goes into voice, images and montage
+    const script = this.expertReview?.enabled()
+      ? await this.runGenerationStage(jobId, 'expert_review', 30, () => this.expertReview.gate({ jobId, strategy, script: draft }))
+      : draft;
 
     // Step 3: Thumbnail Design
     const thumbnail = await this.runGenerationStage(
@@ -1515,6 +2046,18 @@ class YouTubeAutomationAgent {
     await this.db.saveProductionSnapshot(productionData);
     if (!this.provenance) this.provenance = new ProvenanceService(this.db);
     productionData.provenance = await this.provenance.initialize(contentId, productionData);
+    if (autoFactChecker.enabled() && (productionData.provenance?.claims || []).length) {
+      await this.runGenerationStage(jobId, 'fact_check', 85, async () => {
+        try {
+          productionData.provenance = await autoFactChecker.autoReview(this.provenance, contentId, { title: script.title }, this.logger);
+          const summary = productionData.provenance?.summary || {};
+          this.logger.info(`Automated evidence review: ${summary.resolvedClaims || 0}/${summary.claimCount || 0} claims resolved, provenance ${productionData.provenance?.status}`);
+        } catch (error) {
+          this.logger.warn(`Automated fact-check failed; the production stays in human review: ${error.message.slice(0, 200)}`);
+        }
+        return productionData.provenance;
+      });
+    }
     productionData.discoverability = this.discoverability
       ? await this.discoverability.auditProduction(productionData, profile, 'youtube')
       : null;
@@ -1522,30 +2065,52 @@ class YouTubeAutomationAgent {
 
     // Step 6: Quality and approval gate
     return this.runGenerationStage(jobId, 'quality_review', 90, async () => {
-      const approvalRequired = await this.db.getSetting('approval_required') !== 'false';
-      const packagingExperiment = approvalRequired
+      // A reactive video always waits for the operator, who is alerted; it is not slowed by a packaging experiment.
+      const reactive = strategy.origin === 'reactive';
+      const approvalRequired = reactive || await this.db.getSetting('approval_required') !== 'false';
+      const packagingExperiment = approvalRequired && !reactive
         ? await this.preparePackagingExperiment(thumbnail, productionData, seoData, script)
         : null;
+      // The description YouTube receives, on this autonomous path as on the operator's: the AI summary, the
+      // subscribe line, chapters timed on the narrated scenes, then the verified sources and credits.
+      const chapters = await this.buildChapters(contentId);
+      const description = await this.composeDescription(contentId, seoData?.description, chapters, profile);
+      if (isVertical(productionData.assets?.finalVideo)) {
+        productionData.seo = { ...productionData.seo, tags: [...new Set([...(productionData.seo?.tags || []), 'Shorts'])].slice(0, 15) };
+      }
+      const site = siteLink({ id: contentId, strategy: productionData.strategy, script: productionData.script, seo: productionData.seo });
+      productionData.seo = { ...productionData.seo, description, chapters, ...(site ? { siteSlug: site.slug } : {}) };
+      await this.db.saveProductionSnapshot(productionData);
       const quality = await this.operator.runQualityChecks(productionData, profile);
+      // A reaction that passed every check is approved by Jev instead of waiting for the operator.
+      const jevApproval = reactive && quality.passed ? await this.operator.reactiveApproval?.(productionData).catch(error => ({
+        approved: false, reasons: [`l'approbation par Jev a échoué (${error.message.slice(0, 120)})`], fidelity: []
+      })) : null;
+      const autoApproved = Boolean(jevApproval?.approved);
       const reviewStatus = quality.passed
-        ? (approvalRequired ? 'needs_review' : 'approved')
+        ? (approvalRequired && !autoApproved ? 'needs_review' : 'approved')
         : 'needs_attention';
       await this.db.saveContentReview(contentId, {
         status: reviewStatus,
         qualityChecks: quality.checks,
-        editorData: packagingExperiment ? {
-          packagingExperiment,
-          selectedTitleVariant: 0,
-          selectedThumbnailVariant: 0
-        } : {},
-        reviewNotes: quality.passed ? null : `Blocking checks failed: ${quality.blockingFailures.join(', ')}`,
-        reviewedAt: approvalRequired ? null : new Date().toISOString()
+        editorData: {
+          ...(packagingExperiment ? { packagingExperiment, selectedTitleVariant: 0, selectedThumbnailVariant: 0 } : {}),
+          description
+        },
+        reviewNotes: !quality.passed
+          ? `Blocking checks failed: ${quality.blockingFailures.join(', ')}`
+          : autoApproved ? `Approuvé par Jev : faits vérifiés, ton vérifié, ${jevApproval.fidelity.length} citation(s) fidèle(s)` : null,
+        reviewedAt: approvalRequired && !autoApproved ? null : new Date().toISOString()
       });
 
       let scheduleEntry = null;
       if (reviewStatus === 'approved') {
         scheduleEntry = await this.agents.publishing.scheduleContent(productionData);
         await this.db.updateProductionStatus(contentId, scheduleEntry ? 'scheduled' : productionData.status);
+        if (reactive) await this.alertReactive(strategy, script, contentId, quality, jevApproval);
+      } else if (reactive) {
+        await this.db.updateProductionStatus(contentId, reviewStatus);
+        await this.alertReactive(strategy, script, contentId, quality, jevApproval);
       } else {
         await this.db.updateProductionStatus(contentId, reviewStatus);
         await this.operator.notify({
@@ -1662,6 +2227,273 @@ class YouTubeAutomationAgent {
     }
   }
 
+  // Used by the continuous-operator cron: same guards as POST /api/operator/start.
+  async startAutonomousRun() {
+    if (this.setupRequired || !this.agents.strategy || !this.autonomous) return null;
+    if (this.activeJobs.size || this.startingJobs || await this.reactiveWaiting()) return null;
+    await this.readiness?.assertReady('Autonomous production');
+    const current = await this.db.getChannelStrategy();
+    if (!current || current.status !== 'active') return null;
+    return this.autonomous.start(current);
+  }
+
+  // For every video published in the last 48 hours without Shorts: propose, render and schedule
+  // SHORTS_PER_VIDEO clips, staggered a few hours apart, with the parent's privacy.
+  async runAutoShorts() {
+    if (!this.shorts || !this.agents.publishing) return;
+    if (await this.db.getSetting('auto_shorts') !== 'true') return;
+    // Editing, judging and rendering a montage takes minutes: a run never overlaps the previous one.
+    if (this.autoShortsRunning) return;
+    this.autoShortsRunning = true;
+    try {
+      await this.editAutoShorts();
+    } finally {
+      this.autoShortsRunning = false;
+    }
+  }
+
+  async editAutoShorts() {
+    const perVideo = Math.max(1, Math.min(5, Number(process.env.SHORTS_PER_VIDEO || 2)));
+    const pipeline = await this.db.getProductionPipeline();
+    for (const production of pipeline) {
+      const bundle = await this.db.getProductionBundle(production.id);
+      if (!bundle || bundle.review_status !== 'approved') continue;
+      // A Short is not cut into Shorts, nor a series joined from Shorts.
+      if (isVertical(bundle.assets?.finalVideo) || bundle.strategy?.seriesOf) continue;
+      const schedule = bundle.schedule;
+      if (!schedule || schedule.status !== 'published') continue;
+      const publishedAt = new Date(schedule.published_at || schedule.publishedAt || schedule.publish_time || schedule.publishTime || 0);
+      if (Date.now() - publishedAt.getTime() > 48 * 3600 * 1000) continue;
+      // Shorts approved, published or paused by the operator count; a video gets montages up to SHORTS_PER_VIDEO,
+      // never reusing their sentences.
+      const shorts = bundle.shorts || [];
+      const kept = shorts.filter(clip => ['approved', 'scheduled', 'uploading', 'published', 'reconciliation_required', 'paused'].includes(clip.status));
+      if (kept.length >= perVideo) continue;
+      // The AI editor already judged this video and found no montage worth publishing.
+      if (await this.db.getSetting(`shorts_none_${bundle.id}`)) continue;
+      try {
+        // Drafts left by an interrupted run are replaced.
+        for (const draft of shorts.filter(clip => !kept.includes(clip) && clip.status !== 'cancelled')) {
+          await this.db.updateShortClip(draft.id, { status: 'cancelled', error: 'Replaced by a new automatic montage' });
+        }
+        const clips = await this.shorts.propose(bundle.id, { count: perVideo - kept.length, requireAI: true, append: shorts.length > 0 });
+        const list = Array.isArray(clips) ? clips : (clips.clips || []);
+        if (!list.length) {
+          await this.db.setSetting(`shorts_none_${bundle.id}`, new Date().toISOString(), 'No Short montage passed the editor and the critic');
+          this.logger.info(`No Short published for ${bundle.script?.title}: no montage passed the editor and the critic`);
+          continue;
+        }
+        let scheduled = 0;
+        for (const clip of list) {
+          try {
+            // A montage that fails its render checks (captions, length, sound) is never published.
+            await this.shorts.render(bundle.id, clip.id);
+            const publishTime = new Date(Date.now() + (scheduled * 6 + 1) * 3600 * 1000).toISOString();
+            await this.shorts.approve(bundle.id, clip.id, {
+              confirmed: true, publishTime,
+              privacyStatus: process.env.DEFAULT_PRIVACY_STATUS || 'private'
+            });
+            scheduled++;
+            this.logger.info(`Auto Short scheduled for ${bundle.script?.title}: ${clip.id} at ${publishTime}`);
+          } catch (error) {
+            this.logger.warn(`Auto Short ${clip.id} dropped: ${error.message.slice(0, 300)}`);
+          }
+        }
+        // One editing attempt per video: a montage that failed is not retried every half hour.
+        if (scheduled < list.length) {
+          await this.db.setSetting(`shorts_none_${bundle.id}`, new Date().toISOString(), `${list.length - scheduled} Short montage(s) failed their render checks`);
+        }
+      } catch (error) {
+        this.logger.warn(`Auto Shorts skipped for ${bundle.id}: ${error.message.slice(0, 200)}`);
+      }
+    }
+  }
+
+  // The description of a production under review with chapters re-timed on its current scenes. The chapters are kept
+  // in the SEO snapshot so their titles survive later repairs.
+  async reviewDescription(bundle, editedDescription, profile = {}) {
+    const chapters = await this.buildChapters(bundle.id);
+    const site = siteLink(bundle);
+    const description = editedDescription
+      ? await this.finalizeDescription(editedDescription, chapters, profile, site?.line)
+      : await this.composeDescription(bundle.id, bundle.seo?.description, chapters, profile);
+    // The page address goes out with the description: it is recorded so it never changes afterwards.
+    await this.db.saveProductionSnapshot({ ...bundle, seo: { ...bundle.seo, chapters, ...(site ? { siteSlug: site.slug } : {}) } });
+    return { chapters, description };
+  }
+
+  // Rebuilds and pushes the public verification site a minute after a publication (several close publications make
+  // one deployment). Without SITE_BASE_URL there is no site.
+  requestSiteUpdate() {
+    if (!siteBaseUrl()) return;
+    clearTimeout(this.siteTimer);
+    this.siteTimer = setTimeout(() => { void this.updateSite(); }, 60000);
+    this.siteTimer.unref?.();
+  }
+
+  async updateSite() {
+    if (!siteBaseUrl()) return null;
+    try {
+      const result = await deploySite(this.db, { logger: this.logger });
+      if (result.deployed || result.reason === 'no change') await this.db.setSetting('site_rebuild_needed', 'false');
+      return result;
+    } catch (error) {
+      this.logger.warn(`Verification site update failed: ${error.message}`);
+      return null;
+    }
+  }
+
+  // Final description of a long video: the AI summary without any timestamps of its own, the subscribe line, then
+  // the chapters and the extras below.
+  async composeDescription(productionId, baseDescription, chapters = [], profile = {}) {
+    const base = stripTimestamps(baseDescription).split('\n').filter(line => !/^(🔔|🔎|📌|▶️)/u.test(line) && line.trim() !== '#Shorts').join('\n')
+      .replace(/\n{3,}/g, '\n\n').trim();
+    const bundle = await Promise.resolve().then(() => this.db.getProductionBundle(productionId)).catch(() => null);
+    const site = siteLink(bundle || { id: productionId });
+    const examined = bundle?.strategy?.examinedVideo;
+    const examinedLine = examined?.url ? `📌 Vidéo examinée : « ${examined.title} » (${examined.channel}) : ${examined.url}` : null;
+    const head = [base, subscribeLine(profile.call_to_action, await this.youtubeChannelId()), site?.line, examinedLine, await this.seriesLine(bundle)]
+      .filter(Boolean).join('\n\n');
+    const extras = await this.buildDescriptionExtras(productionId, head.length, this.chapterBlock(chapters));
+    return [head, extras, isVertical(bundle?.assets?.finalVideo) ? '#Shorts' : null].filter(Boolean).join('\n\n');
+  }
+
+  // A part of a series links the parts already out.
+  async seriesLine(bundle) {
+    const { part, parts } = seriesOf(bundle?.strategy);
+    if (parts < 2 || part < 2 || !bundle.strategy?.reactiveId) return null;
+    const item = await this.db.getReactiveItem?.(bundle.strategy.reactiveId).catch(() => null);
+    const earlier = item ? (await this.publishedParts(item)).filter(episode => episode.part < part) : [];
+    return earlier.length ? earlier.map(episode => `▶️ Partie ${episode.part} : ${episode.entry.youtubeUrl}`).join('\n') : null;
+  }
+
+  // A description edited in the review studio keeps its wording: its chapter list is re-timed on the current scenes
+  // and the subscribe line is put back when it was removed.
+  async finalizeDescription(description, chapters = [], profile = {}, siteLine = null) {
+    let result = replaceChapterBlock(description, this.chapterBlock(chapters));
+    if (!/^🔔/m.test(result)) {
+      const [first, ...rest] = result.split('\n\n');
+      result = [first, subscribeLine(profile.call_to_action, await this.youtubeChannelId()), ...rest].filter(Boolean).join('\n\n');
+    }
+    if (siteLine && !/^🔎/m.test(result)) {
+      const paragraphs = result.split('\n\n');
+      const after = paragraphs.findIndex(paragraph => paragraph.startsWith('🔔'));
+      paragraphs.splice(after + 1, 0, siteLine);
+      result = paragraphs.join('\n\n');
+    }
+    return result;
+  }
+
+  chapterBlock(chapters = []) {
+    return formatChapterBlock(chapters, { totalDuration: chapters.length ? chapters[chapters.length - 1].end : 0 });
+  }
+
+  // Chapters of a long video: spans of the narrated scenes timed on their measured durations and titled from what
+  // each one says. Titles already chosen for the same scenes are kept, so a scene repair only moves the timestamps.
+  async buildChapters(productionId) {
+    try {
+      const bundle = await this.db.getProductionBundle(productionId);
+      const scenes = bundle?.scenes || [];
+      // A Short has no chapters.
+      if (!scenes.length || isVertical(bundle.assets?.finalVideo)) return [];
+      const registers = scriptScenes(bundle.script || {}).map(blueprint => blueprint.register);
+      const spans = chapterSpans(scenes, { registers });
+      const key = span => span.sceneIds.join(',');
+      const known = new Map((bundle.seo?.chapters || []).filter(chapter => Array.isArray(chapter.sceneIds)).map(chapter => [key(chapter), chapter.title]));
+      const titles = spans.every(span => known.has(key(span)))
+        ? spans.map(span => known.get(key(span)))
+        : await titleChapters(spans, this.chapterTextService(), { logger: this.logger });
+      return spans.map((span, index) => ({
+        start: Number(span.start.toFixed(2)), end: Number(span.end.toFixed(2)),
+        time: formatTimestamp(span.start), title: titles[index], sceneIds: span.sceneIds
+      }));
+    } catch (error) {
+      this.logger.warn(`Chapters skipped: ${error.message}`);
+      return [];
+    }
+  }
+
+  chapterTextService() {
+    if (!this.chapterText) this.chapterText = this.shorts?.aiTextService || new AITextService(this.credentials?.credentials || {});
+    return this.chapterText;
+  }
+
+  // The channel id for the subscribe link, asked once to YouTube (1 quota unit) and remembered.
+  async youtubeChannelId() {
+    const cached = await this.db.getSetting('youtube_channel_id');
+    if (cached) return cached;
+    const youtube = this.agents?.publishing?.youtube;
+    if (!youtube?.channels?.list) return null;
+    try {
+      const response = await youtube.channels.list({ part: ['id'], mine: true });
+      const id = response?.data?.items?.[0]?.id || null;
+      if (id) await this.db.setSetting('youtube_channel_id', id, 'Channel id used in the subscribe link of descriptions');
+      return id;
+    } catch (error) {
+      this.logger.warn(`Subscribe link without channel id: ${error.message}`);
+      return null;
+    }
+  }
+
+  // The chapters, the verified sources, the music attribution and the credits of the images and translations shown
+  // on screen. The image credits go last and are shortened line by line when the whole description would exceed
+  // YouTube's limit.
+  async buildDescriptionExtras(productionId, baseLength = 0, chapters = '') {
+    let sourcesBlock = '';
+    try {
+      const provenance = await this.db.getContentProvenance(productionId);
+      const verified = (provenance?.sources || []).filter(source => source.status === 'verified').slice(0, 12);
+      if (verified.length) {
+        const lang = process.env.CONTENT_LANGUAGE || 'en';
+        sourcesBlock = `${lang === 'fr' ? 'SOURCES (vérifiées)' : 'SOURCES (verified)'}\n` +
+          verified.map(source => `• ${source.title}${source.publisher ? ` (${source.publisher})` : ''} : ${source.url}`).join('\n');
+      }
+    } catch (error) {
+      this.logger.warn(`Sources block skipped: ${error.message}`);
+    }
+    const blocks = [chapters, sourcesBlock, await this.buildMusicCredits(productionId)].filter(Boolean);
+    const [heading, ...credits] = await this.buildInsertCredits(productionId);
+    const room = MAX_DESCRIPTION_LENGTH - baseLength - blocks.reduce((sum, block) => sum + block.length + 2, 2);
+    while (credits.length && [heading, ...credits].join('\n').length > room) credits.pop();
+    if (credits.length) blocks.push([heading, ...credits].join('\n'));
+    return blocks.join('\n\n');
+  }
+
+  // Attribution required by some audio-library tracks (the .txt next to the track in data/music).
+  async buildMusicCredits(productionId) {
+    try {
+      const bundle = await this.db.getProductionBundle(productionId);
+      const credits = bundle?.assets?.music?.credits || [];
+      if (!credits.length) return '';
+      return `${(process.env.CONTENT_LANGUAGE || 'en') === 'fr' ? 'MUSIQUE' : 'MUSIC'}\n${credits.map(credit => `• ${credit}`).join('\n')}`;
+    } catch (error) {
+      this.logger.warn(`Music credits skipped: ${error.message}`);
+      return '';
+    }
+  }
+
+  // [heading, ...lines] for the Wikimedia Commons images and scripture translations of the visual inserts.
+  async buildInsertCredits(productionId) {
+    try {
+      const bundle = await this.db.getProductionBundle(productionId);
+      const credits = bundle?.assets?.inserts?.credits || [];
+      if (!credits.length) return [];
+      const fr = (process.env.CONTENT_LANGUAGE || 'en') === 'fr';
+      const author = value => {
+        const text = String(value || '').replace(/\[[^\]]*\]/g, '').replace(/\s+/g, ' ').replace(/[\s.;,]+$/, '').trim();
+        if (/^(unknown|anonymous|inconnu|anonyme)\b/i.test(text)) return '';
+        return text.length > 70 ? `${text.slice(0, 70).replace(/\s+\S*$/, '')}…` : text;
+      };
+      const lines = credits.map(credit => credit.kind === 'text'
+        ? `• ${credit.work} : ${fr ? 'traduction' : 'translation'} ${credit.edition}`
+        : `• ${credit.article || credit.file} : ${[author(credit.author), credit.license].filter(Boolean).join(', ')}, Wikimedia Commons ${credit.shortUrl || credit.url}`);
+      return [fr ? 'IMAGES ET TEXTES CITÉS' : 'IMAGE AND TEXT CREDITS', ...new Set(lines)];
+    } catch (error) {
+      this.logger.warn(`Insert credits skipped: ${error.message}`);
+      return [];
+    }
+  }
+
   validateProfile(input) {
     const textFields = ['channelName', 'goal', 'targetAudience', 'brandVoice', 'defaultStyle', 'callToAction', 'visualStyle', 'timezone'];
     const result = {};
@@ -1711,14 +2543,17 @@ class YouTubeAutomationAgent {
     const bundle = await this.db.getProductionBundle(productionId);
     if (!bundle) return null;
     const profile = await this.db.getChannelProfile() || {};
+    // Repaired scenes move the chapters: re-time them (titles are kept per scene) in the description under review.
+    const { chapters, description } = await this.reviewDescription(bundle, bundle.editorData?.description, profile);
     const quality = await this.operator.runQualityChecks({
       ...bundle,
+      seo: { ...bundle.seo, description, chapters },
       scheduledPublishTime: bundle.scheduled_publish_time
     }, profile);
     const status = quality.passed ? 'needs_review' : 'needs_attention';
     return this.db.saveContentReview(productionId, {
       status,
-      editorData: { ...(bundle.editorData || {}), factChecked: false, rightsConfirmed: false },
+      editorData: { ...(bundle.editorData || {}), description, factChecked: false, rightsConfirmed: false },
       qualityChecks: quality.checks,
       reviewNotes: reviewNotes || (quality.passed ? null : `Blocking checks failed: ${quality.blockingFailures.join(', ')}`),
       reviewedAt: null
@@ -1757,7 +2592,6 @@ class YouTubeAutomationAgent {
       seo: {
         ...bundle.seo,
         title: editorData.title || bundle.seo.title,
-        description: editorData.description || bundle.seo.description,
         tags: editorData.tags || bundle.seo.tags
       },
       assets: thumbnailVariant
@@ -1773,6 +2607,9 @@ class YouTubeAutomationAgent {
       scenes: bundle.scenes || []
     };
     const profile = await this.db.getChannelProfile() || {};
+    const { chapters, description } = await this.reviewDescription(bundle, editorData.description, profile);
+    editorData.description = description;
+    productionData.seo = { ...productionData.seo, description, chapters };
     const quality = await this.operator.runQualityChecks(productionData, profile);
     if (!quality.passed) {
       await this.db.saveContentReview(bundle.id, {
@@ -1861,4 +2698,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { YouTubeAutomationAgent };
+module.exports = { YouTubeAutomationAgent, strategyContextOf, GENERATION_ORIGINS };

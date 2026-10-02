@@ -2,15 +2,18 @@ const MAX_TITLE_LENGTH = 100;
 const MAX_DESCRIPTION_LENGTH = 5000;
 const MAX_TAGS_LENGTH = 450;
 
-function removeControlCharacters(value, replacement = '') {
-  return Array.from(String(value ?? '')).map(character => {
+// Strips control characters. Line breaks are kept unless keepNewlines is false: YouTube descriptions rely on them
+// for paragraphs, chapters and source lists.
+function removeControlCharacters(value, replacement = '', keepNewlines = true) {
+  return Array.from(String(value ?? '').replace(/\r\n?/g, '\n')).map(character => {
     const code = character.charCodeAt(0);
+    if (code === 10 && keepNewlines) return character;
     return code <= 31 || code === 127 ? replacement : character;
   }).join('');
 }
 
 function cleanText(value) {
-  return removeControlCharacters(value, ' ').replace(/\s+/g, ' ').trim();
+  return removeControlCharacters(value, ' ', false).replace(/\s+/g, ' ').trim();
 }
 
 function normalizeTags(input) {

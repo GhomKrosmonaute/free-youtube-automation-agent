@@ -11,6 +11,8 @@ class PublishingSchedulingAgent {
     this.credentials = credentials;
     this.logger = new Logger('PublishingScheduling');
     this.youtube = null;
+    // Called once a video is on YouTube (public verification site); never blocks or fails the publication.
+    this.onPublished = null;
     this.publishQueue = [];
   }
 
@@ -73,13 +75,14 @@ class PublishingSchedulingAgent {
         priority: productionData.priority,
         metadata: {
           seo: productionData.seo,
-          thumbnail: productionData.assets.thumbnail,
+          // A vertical video is a Short: YouTube picks its frame, no thumbnail is sent.
+          thumbnail: productionData.assets.finalVideo?.aspectRatio === '9:16' ? null : productionData.assets.thumbnail,
           video: productionData.assets.finalVideo,
           audio: productionData.assets.audio,
           captions: productionData.assets.captions,
           privacyStatus: productionData.privacyStatus || process.env.DEFAULT_PRIVACY_STATUS || 'private',
           containsSyntheticMedia: productionData.containsSyntheticMedia === true,
-          contentType: productionData.contentType || 'long_form',
+          contentType: productionData.contentType || (productionData.assets.finalVideo?.aspectRatio === '9:16' ? 'short' : 'long_form'),
           sourceProductionId: productionData.sourceProductionId || productionData.id,
           shortClipId: productionData.shortClipId || null
         },
@@ -184,6 +187,7 @@ class PublishingSchedulingAgent {
       
       await this.db.updateScheduleEntry(scheduleEntry);
       await this.syncShortStatus(scheduleEntry, 'published');
+      this.notifyPublished(scheduleEntry);
       
       // Remove from queue
       this.publishQueue = this.publishQueue.filter(entry => entry.productionId !== scheduleEntry.productionId);
@@ -270,6 +274,12 @@ class PublishingSchedulingAgent {
     }
   }
 
+  notifyPublished(scheduleEntry) {
+    if (!this.onPublished) return;
+    Promise.resolve().then(() => this.onPublished(scheduleEntry))
+      .catch(error => this.logger.warn(`After-publication task failed: ${error.message}`));
+  }
+
   isUploadOutcomeUnknown(error) {
     const status = Number(error.status || error.response?.status || 0);
     return !status || status >= 500;
@@ -293,6 +303,7 @@ class PublishingSchedulingAgent {
     scheduleEntry.error = null;
     await this.db.updateScheduleEntry(scheduleEntry);
     await this.syncShortStatus(scheduleEntry, 'published');
+    this.notifyPublished(scheduleEntry);
     this.publishQueue = this.publishQueue.filter(entry => entry.productionId !== scheduleEntry.productionId);
     this.logger.success(`Reconciled existing YouTube upload: ${scheduleEntry.youtubeUrl}`);
     return scheduleEntry;

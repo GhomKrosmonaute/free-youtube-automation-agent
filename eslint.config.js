@@ -2,7 +2,7 @@ const js = require('@eslint/js');
 
 module.exports = [
   {
-    ignores: [
+    ignores: ['.venv*/**', 
       'node_modules/**',
       'coverage/**',
       'logs/**',

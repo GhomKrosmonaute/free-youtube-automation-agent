@@ -3,11 +3,15 @@ const fs = require('fs').promises;
 const GENERATION_STAGES = [
   'strategy',
   'script',
+  'expert_review',
   'thumbnail',
   'seo',
   'production',
+  'fact_check',
   'quality_review'
 ];
+// Stages that only run when enabled: without a checkpoint they were skipped, not left unfinished.
+const OPTIONAL_STAGES = new Set(['expert_review']);
 
 class GenerationRecoveryService {
   constructor(db, options = {}) {
@@ -62,7 +66,8 @@ class GenerationRecoveryService {
       } catch (error) {
         lastError = error;
         await this.db.saveGenerationCheckpoint(jobId, stage, {
-          status: error.code === 'JOB_CANCELLED' ? 'cancelled' : 'failed',
+          // A stage that holds the job for a human (expert review) says so instead of reading as a failure.
+          status: error.checkpointStatus || (error.code === 'JOB_CANCELLED' ? 'cancelled' : 'failed'),
           error: error.message,
           completedAt: new Date().toISOString()
         });
@@ -79,12 +84,14 @@ class GenerationRecoveryService {
     if (!artifact || typeof artifact !== 'object') return false;
     if (stage === 'strategy') return Boolean(artifact.topic);
     if (stage === 'script') return Boolean(artifact.title && (artifact.fullScript || artifact.mainContent));
+    if (stage === 'expert_review') return Boolean(artifact.title && (artifact.fullScript || artifact.mainContent) && artifact.expertReview);
     if (stage === 'thumbnail') return this.validatePathArtifact(artifact.path);
     if (stage === 'seo') return Boolean(artifact.title && artifact.description && Array.isArray(artifact.tags));
     if (stage === 'production') {
       const finalVideo = artifact.assets?.finalVideo;
       return Boolean(artifact.id && finalVideo?.path && await this.pathExists(finalVideo.path));
     }
+    if (stage === 'fact_check') return true;
     if (stage === 'quality_review') return Boolean(artifact.contentId && artifact.reviewStatus);
     return false;
   }
@@ -117,7 +124,11 @@ class GenerationRecoveryService {
 
   resumePoint(checkpoints = []) {
     const byStage = new Map(checkpoints.map(checkpoint => [checkpoint.stage, checkpoint]));
-    return GENERATION_STAGES.find(stage => byStage.get(stage)?.status !== 'completed') || 'quality_review';
+    return GENERATION_STAGES.find(stage => {
+      const checkpoint = byStage.get(stage);
+      if (!checkpoint && OPTIONAL_STAGES.has(stage)) return false;
+      return checkpoint?.status !== 'completed';
+    }) || 'quality_review';
   }
 
   async resetFrom(jobId, requestedStage) {
